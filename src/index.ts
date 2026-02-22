@@ -1458,6 +1458,211 @@ const clientIdSchema = z
   )
   .optional();
 
+const dexActionEnum = [
+  "explorer.select.replace",
+  "explorer.select.add",
+  "explorer.select.remove",
+  "explorer.select.clear",
+  "explorer.search.set",
+  "explorer.search.clear",
+  "explorer.expand.all",
+  "explorer.collapse.all",
+  "explorer.jump_to_parent",
+  "explorer.select_children",
+  "explorer.rename",
+  "explorer.cut",
+  "explorer.copy",
+  "explorer.paste_into",
+  "explorer.duplicate",
+  "explorer.delete",
+  "explorer.group",
+  "explorer.ungroup",
+  "explorer.reparent",
+  "explorer.insert_object",
+  "explorer.copy_path",
+  "explorer.call_function",
+  "explorer.get_lua_references",
+  "explorer.save_instance",
+  "explorer.view_connections",
+  "explorer.view_api",
+  "explorer.view_object",
+  "explorer.view_script",
+  "explorer.select_character",
+  "explorer.refresh_nil",
+  "explorer.hide_nil.toggle",
+  "explorer.teleport_to",
+  "properties.select_target",
+  "properties.search.set",
+  "properties.search.clear",
+  "properties.set",
+  "properties.set_batch",
+  "properties.clear_value",
+  "properties.expand_category",
+  "properties.expand_property",
+  "properties.attributes.add",
+  "properties.attributes.edit",
+  "properties.attributes.remove",
+  "properties.attributes.toggle_visibility",
+  "properties.sound_preview.play",
+  "properties.sound_preview.pause",
+  "properties.sound_preview.stop",
+  "script_viewer.open",
+  "script_viewer.get_text",
+  "script_viewer.copy_text",
+  "script_viewer.save_to_file",
+  "main.menu.set_open",
+  "main.app.set_open",
+  "main.window.focus",
+  "main.settings.get",
+  "main.settings.set",
+  "main.settings.reset",
+] as const;
+
+const dexActionPayloadRequirements: Record<string, string[]> = {
+  "explorer.rename": ["name"],
+  "explorer.insert_object": ["className"],
+  "explorer.call_function": ["args"],
+  "explorer.save_instance": ["filePath"],
+  "explorer.reparent": ["newParentPath"],
+  "explorer.search.set": ["query"],
+  "properties.search.set": ["query"],
+  "properties.set": ["name", "value|valueRaw"],
+  "properties.set_batch": ["patches"],
+  "properties.clear_value": ["name"],
+  "properties.expand_category": ["categoryName"],
+  "properties.expand_property": ["fullName"],
+  "properties.attributes.add": ["name", "value"],
+  "properties.attributes.edit": ["name", "value"],
+  "properties.attributes.remove": ["name"],
+  "properties.attributes.toggle_visibility": ["visible?"],
+  "script_viewer.save_to_file": ["filePath?"],
+  "main.menu.set_open": ["open"],
+  "main.app.set_open": ["appName", "open"],
+  "main.window.focus": ["appName"],
+  "main.settings.get": ["path?"],
+  "main.settings.set": ["path", "value"],
+};
+
+const dexWriteActionSet = new Set<string>([
+  "explorer.select.replace",
+  "explorer.select.add",
+  "explorer.select.remove",
+  "explorer.select.clear",
+  "explorer.search.set",
+  "explorer.search.clear",
+  "explorer.expand.all",
+  "explorer.collapse.all",
+  "explorer.jump_to_parent",
+  "explorer.select_children",
+  "explorer.rename",
+  "explorer.cut",
+  "explorer.copy",
+  "explorer.paste_into",
+  "explorer.duplicate",
+  "explorer.delete",
+  "explorer.group",
+  "explorer.ungroup",
+  "explorer.reparent",
+  "explorer.insert_object",
+  "explorer.copy_path",
+  "explorer.call_function",
+  "explorer.get_lua_references",
+  "explorer.save_instance",
+  "explorer.view_connections",
+  "explorer.view_api",
+  "explorer.view_object",
+  "explorer.view_script",
+  "explorer.select_character",
+  "explorer.refresh_nil",
+  "explorer.hide_nil.toggle",
+  "explorer.teleport_to",
+  "properties.select_target",
+  "properties.search.set",
+  "properties.search.clear",
+  "properties.set",
+  "properties.set_batch",
+  "properties.clear_value",
+  "properties.expand_category",
+  "properties.expand_property",
+  "properties.attributes.add",
+  "properties.attributes.edit",
+  "properties.attributes.remove",
+  "properties.attributes.toggle_visibility",
+  "properties.sound_preview.play",
+  "properties.sound_preview.pause",
+  "properties.sound_preview.stop",
+  "script_viewer.open",
+  "script_viewer.copy_text",
+  "script_viewer.save_to_file",
+  "main.menu.set_open",
+  "main.app.set_open",
+  "main.window.focus",
+  "main.settings.set",
+  "main.settings.reset",
+]);
+
+type DexAction = (typeof dexActionEnum)[number];
+
+async function callClientTool(
+  toolType: string,
+  payload: Record<string, unknown>,
+  clientId: string | undefined,
+  failurePrefix: string
+) {
+  const toolCallId = SendArbitraryDataToClient(toolType, payload, undefined, clientId);
+  if (toolCallId === null) {
+    return NO_CLIENT_ERROR;
+  }
+
+  const response = (await GetResponseOfIdFromClient(toolCallId)) as
+    | { output: string }
+    | undefined;
+
+  if (response === undefined || response.output === undefined) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${failurePrefix}. Response: ${JSON.stringify(response)}`,
+        },
+      ],
+    };
+  }
+
+  return {
+    content: [{ type: "text" as const, text: response.output }],
+  };
+}
+
+function registerDexActionWrapper(
+  name: string,
+  title: string,
+  description: string,
+  inputSchema: z.ZodTypeAny,
+  buildActionRequest: (input: Record<string, unknown>) => Record<string, unknown>,
+) {
+  server.registerTool(
+    name,
+    {
+      title,
+      description,
+      inputSchema,
+    },
+    async (args: unknown) => {
+      const input = (args || {}) as Record<string, unknown>;
+      const clientId =
+        typeof input.clientId === "string" ? input.clientId : undefined;
+      const actionRequest = buildActionRequest(input);
+      return callClientTool(
+        "dex-action",
+        actionRequest,
+        clientId,
+        `Failed to run ${name}`,
+      );
+    },
+  );
+}
+
 // ─── Tool registrations (work in both primary & secondary mode) ─────────────────
 
 server.registerTool(
@@ -2936,6 +3141,517 @@ server.registerTool(
       content: [{ type: "text", text: response.output }],
     };
   }
+);
+
+const dexPayloadSchema = z.record(z.string(), z.unknown());
+const dexActionSchema = z.enum(dexActionEnum);
+
+server.registerTool(
+  "dex-action",
+  {
+    title: "Execute a low-level Dex action",
+    description:
+      "Executes one Dex action through the action bus. This is the low-level backdoor for full Dex parity.",
+    inputSchema: z.object({
+      action: dexActionSchema,
+      instancePath: z.string().optional(),
+      instancePaths: z.array(z.string()).optional(),
+      selectionIndex: z.number().int().min(1).optional(),
+      selectionIndices: z.array(z.number().int().min(1)).optional(),
+      payload: dexPayloadSchema.optional(),
+      options: z
+        .object({
+          returnSnapshot: z.boolean().optional().default(true),
+          requireBridgeReady: z.boolean().optional().default(true),
+          preserveUi: z.boolean().optional().default(true),
+        })
+        .optional(),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({
+    action,
+    instancePath,
+    instancePaths,
+    selectionIndex,
+    selectionIndices,
+    payload,
+    options,
+    clientId,
+  }) => {
+    return callClientTool(
+      "dex-action",
+      {
+        action,
+        instancePath: instancePath || "",
+        instancePaths: instancePaths || [],
+        selectionIndex,
+        selectionIndices: selectionIndices || [],
+        payload: payload || {},
+        options: options || {},
+      },
+      clientId,
+      "Failed to execute dex-action",
+    );
+  },
+);
+
+server.registerTool(
+  "dex-batch-actions",
+  {
+    title: "Execute multiple Dex actions",
+    description:
+      "Executes multiple dex-action steps in one request. Supports stopOnError for transactional-like behavior.",
+    inputSchema: z.object({
+      actions: z.array(
+        z.object({
+          action: dexActionSchema,
+          instancePath: z.string().optional(),
+          instancePaths: z.array(z.string()).optional(),
+          selectionIndex: z.number().int().min(1).optional(),
+          selectionIndices: z.array(z.number().int().min(1)).optional(),
+          payload: dexPayloadSchema.optional(),
+          options: z
+            .object({
+              returnSnapshot: z.boolean().optional(),
+              requireBridgeReady: z.boolean().optional(),
+              preserveUi: z.boolean().optional(),
+            })
+            .optional(),
+        }),
+      ),
+      stopOnError: z.boolean().optional().default(true),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ actions, stopOnError, clientId }) => {
+    return callClientTool(
+      "dex-batch-actions",
+      { actions, stopOnError },
+      clientId,
+      "Failed to execute dex-batch-actions",
+    );
+  },
+);
+
+server.registerTool(
+  "dex-list-capabilities",
+  {
+    title: "List Dex action capabilities",
+    description:
+      "Returns supported Dex actions, payload requirements, and bridge readiness details.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    const maybeClientResponse = await callClientTool(
+      "dex-list-capabilities",
+      {},
+      clientId,
+      "Failed to list Dex capabilities",
+    );
+
+    if (maybeClientResponse === NO_CLIENT_ERROR) {
+      const descriptors = dexActionEnum.map((action) => ({
+        action,
+        requiresBridgeReady: dexWriteActionSet.has(action),
+        requiredPayloadKeys: dexActionPayloadRequirements[action] || [],
+      }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                status: "ok",
+                bridgeReady: false,
+                bridgeStatus: "no_client",
+                bridgeVersion: null,
+                bridgeMessage:
+                  "No Roblox client connected; returning static action schema.",
+                actions: dexActionEnum,
+                descriptors,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    return maybeClientResponse;
+  },
+);
+
+const dexExplorerContextActionMap = {
+  rename: "explorer.rename",
+  cut: "explorer.cut",
+  copy: "explorer.copy",
+  paste_into: "explorer.paste_into",
+  duplicate: "explorer.duplicate",
+  delete: "explorer.delete",
+  group: "explorer.group",
+  ungroup: "explorer.ungroup",
+  reparent: "explorer.reparent",
+  insert_object: "explorer.insert_object",
+  copy_path: "explorer.copy_path",
+  call_function: "explorer.call_function",
+  get_lua_references: "explorer.get_lua_references",
+  save_instance: "explorer.save_instance",
+  view_connections: "explorer.view_connections",
+  view_api: "explorer.view_api",
+  view_object: "explorer.view_object",
+  view_script: "explorer.view_script",
+  select_character: "explorer.select_character",
+  refresh_nil: "explorer.refresh_nil",
+  hide_nil_toggle: "explorer.hide_nil.toggle",
+  teleport_to: "explorer.teleport_to",
+  jump_to_parent: "explorer.jump_to_parent",
+  select_children: "explorer.select_children",
+  expand_all: "explorer.expand.all",
+  collapse_all: "explorer.collapse.all",
+} as const;
+
+registerDexActionWrapper(
+  "dex-explorer-select",
+  "Select in Dex Explorer",
+  "Replace/add/remove/clear Dex Explorer selection.",
+  z.object({
+    mode: z.enum(["replace", "add", "remove", "clear"]),
+    instancePath: z.string().optional(),
+    instancePaths: z.array(z.string()).optional(),
+    selectionIndex: z.number().int().min(1).optional(),
+    selectionIndices: z.array(z.number().int().min(1)).optional(),
+    clientId: clientIdSchema,
+  }),
+  (input) => {
+    const mode = input.mode as "replace" | "add" | "remove" | "clear";
+    if (mode === "clear") {
+      return {
+        action: "explorer.select.clear",
+        options: { returnSnapshot: true, requireBridgeReady: true },
+      };
+    }
+    return {
+      action: `explorer.select.${mode}`,
+      instancePath: input.instancePath || "",
+      instancePaths: (input.instancePaths as string[]) || [],
+      selectionIndex: input.selectionIndex,
+      selectionIndices: (input.selectionIndices as number[]) || [],
+      options: { returnSnapshot: true, requireBridgeReady: true },
+    };
+  },
+);
+
+registerDexActionWrapper(
+  "dex-explorer-context-action",
+  "Run Dex Explorer context action",
+  "Runs one Explorer context-equivalent action via Dex action bus.",
+  z.object({
+    contextAction: z.enum([
+      "rename",
+      "cut",
+      "copy",
+      "paste_into",
+      "duplicate",
+      "delete",
+      "group",
+      "ungroup",
+      "reparent",
+      "insert_object",
+      "copy_path",
+      "call_function",
+      "get_lua_references",
+      "save_instance",
+      "view_connections",
+      "view_api",
+      "view_object",
+      "view_script",
+      "select_character",
+      "refresh_nil",
+      "hide_nil_toggle",
+      "teleport_to",
+      "jump_to_parent",
+      "select_children",
+      "expand_all",
+      "collapse_all",
+    ]),
+    instancePath: z.string().optional(),
+    instancePaths: z.array(z.string()).optional(),
+    selectionIndex: z.number().int().min(1).optional(),
+    selectionIndices: z.array(z.number().int().min(1)).optional(),
+    payload: dexPayloadSchema.optional(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action:
+      dexExplorerContextActionMap[
+        input.contextAction as keyof typeof dexExplorerContextActionMap
+      ],
+    instancePath: input.instancePath || "",
+    instancePaths: (input.instancePaths as string[]) || [],
+    selectionIndex: input.selectionIndex,
+    selectionIndices: (input.selectionIndices as number[]) || [],
+    payload: (input.payload as Record<string, unknown>) || {},
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-explorer-move",
+  "Move instances in Explorer",
+  "Reparent selected/target instances to a new parent.",
+  z.object({
+    newParentPath: z.string(),
+    instancePath: z.string().optional(),
+    instancePaths: z.array(z.string()).optional(),
+    selectionIndex: z.number().int().min(1).optional(),
+    selectionIndices: z.array(z.number().int().min(1)).optional(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "explorer.reparent",
+    instancePath: input.instancePath || "",
+    instancePaths: (input.instancePaths as string[]) || [],
+    selectionIndex: input.selectionIndex,
+    selectionIndices: (input.selectionIndices as number[]) || [],
+    payload: { newParentPath: input.newParentPath },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-explorer-insert-object",
+  "Insert object in Explorer",
+  "Insert a new Roblox instance by class name.",
+  z.object({
+    className: z.string(),
+    parentPath: z.string().optional(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "explorer.insert_object",
+    instancePath: input.parentPath || "",
+    payload: {
+      className: input.className,
+      parentPath: input.parentPath || "",
+    },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-properties-set",
+  "Set one Dex property",
+  "Set a single property through Dex Properties parser path.",
+  z.object({
+    name: z.string(),
+    value: z.unknown().optional(),
+    valueRaw: z.string().optional(),
+    valueTypeHint: z.string().optional(),
+    clear: z.boolean().optional().default(false),
+    instancePath: z.string().optional(),
+    selectionIndex: z.number().int().min(1).optional().default(1),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action:
+      input.clear === true ? "properties.clear_value" : "properties.set",
+    instancePath: input.instancePath || "",
+    selectionIndex: input.selectionIndex,
+    payload: {
+      name: input.name,
+      value: input.value,
+      valueRaw: input.valueRaw,
+      valueTypeHint: input.valueTypeHint,
+      clear: input.clear,
+    },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-properties-set-batch",
+  "Set multiple Dex properties",
+  "Apply multiple property updates in one action.",
+  z.object({
+    patches: z.array(
+      z.object({
+        name: z.string(),
+        value: z.unknown().optional(),
+        valueRaw: z.string().optional(),
+        valueTypeHint: z.string().optional(),
+        clear: z.boolean().optional(),
+      }),
+    ),
+    instancePath: z.string().optional(),
+    selectionIndex: z.number().int().min(1).optional().default(1),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "properties.set_batch",
+    instancePath: input.instancePath || "",
+    selectionIndex: input.selectionIndex,
+    payload: { patches: input.patches },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-attributes-upsert",
+  "Add or update attribute",
+  "Upsert one attribute on the target instance.",
+  z.object({
+    name: z.string(),
+    value: z.unknown(),
+    instancePath: z.string().optional(),
+    selectionIndex: z.number().int().min(1).optional().default(1),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "properties.attributes.add",
+    instancePath: input.instancePath || "",
+    selectionIndex: input.selectionIndex,
+    payload: {
+      name: input.name,
+      value: input.value,
+    },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-attributes-remove",
+  "Remove attribute",
+  "Remove one attribute from the target instance.",
+  z.object({
+    name: z.string(),
+    instancePath: z.string().optional(),
+    selectionIndex: z.number().int().min(1).optional().default(1),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "properties.attributes.remove",
+    instancePath: input.instancePath || "",
+    selectionIndex: input.selectionIndex,
+    payload: { name: input.name },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-script-viewer-open",
+  "Open script in Dex Script Viewer",
+  "Open a script target in Dex Script Viewer.",
+  z.object({
+    instancePath: z.string().optional(),
+    selectionIndex: z.number().int().min(1).optional().default(1),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "script_viewer.open",
+    instancePath: input.instancePath || "",
+    selectionIndex: input.selectionIndex,
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-script-viewer-export",
+  "Export script viewer text",
+  "Export current Script Viewer text to file, clipboard, or raw output.",
+  z.object({
+    filePath: z.string().optional(),
+    copyToClipboard: z.boolean().optional().default(false),
+    clientId: clientIdSchema,
+  }),
+  (input) => {
+    if (typeof input.filePath === "string" && input.filePath !== "") {
+      return {
+        action: "script_viewer.save_to_file",
+        payload: { filePath: input.filePath },
+        options: { returnSnapshot: true, requireBridgeReady: true },
+      };
+    }
+    if (input.copyToClipboard === true) {
+      return {
+        action: "script_viewer.copy_text",
+        options: { returnSnapshot: true, requireBridgeReady: true },
+      };
+    }
+    return {
+      action: "script_viewer.get_text",
+      options: { returnSnapshot: true, requireBridgeReady: true },
+    };
+  },
+);
+
+registerDexActionWrapper(
+  "dex-main-set-app-open",
+  "Set Dex app open state",
+  "Open or close one Dex app (Explorer/Properties/Script Viewer).",
+  z.object({
+    appName: z.enum(["Explorer", "Properties", "Script Viewer"]),
+    open: z.boolean(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "main.app.set_open",
+    payload: {
+      appName: input.appName,
+      open: input.open,
+    },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-settings-get",
+  "Get Dex settings",
+  "Read Dex settings (full table or one dot path).",
+  z.object({
+    path: z.string().optional(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "main.settings.get",
+    payload: { path: input.path || "" },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-settings-set",
+  "Set Dex setting",
+  "Set one Dex settings path to a value.",
+  z.object({
+    path: z.string(),
+    value: z.unknown(),
+    clientId: clientIdSchema,
+  }),
+  (input) => ({
+    action: "main.settings.set",
+    payload: {
+      path: input.path,
+      value: input.value,
+    },
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
+);
+
+registerDexActionWrapper(
+  "dex-settings-reset",
+  "Reset Dex settings",
+  "Reset Dex settings to defaults.",
+  z.object({
+    clientId: clientIdSchema,
+  }),
+  () => ({
+    action: "main.settings.reset",
+    options: { returnSnapshot: true, requireBridgeReady: true },
+  }),
 );
 
 // ─── Start everything ───────────────────────────────────────────────────────────

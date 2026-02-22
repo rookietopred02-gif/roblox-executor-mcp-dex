@@ -7,7 +7,7 @@ end
 local BridgeURL = getgenv().BridgeURL or ... or "localhost:16384"
 local DEX_SCRIPT_URL = "https://github.com/LorekeeperZinnia/Dex/releases/download/1.0.0/out.lua"
 local DEX_BRIDGE_KEY = "__ROBLOX_EXECUTOR_MCP_DEX_BRIDGE"
-local DEX_BRIDGE_VERSION = "dex-bridge-1"
+local DEX_BRIDGE_VERSION = "dex-bridge-2"
 
 --// Functions \\--
 local LuaEncode = loadstring(game:HttpGet("https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"))()
@@ -813,7 +813,7 @@ local function PatchDexSource(rawSource)
 
     local explorerBridgeSnippet = [[
 	Explorer.__MCP = Explorer.__MCP or {}
-	Explorer.__MCP.Version = "dex-bridge-1"
+	Explorer.__MCP.Version = "dex-bridge-2"
 
 	Explorer.__MCP.GetSelectionNodes = function()
 		local result = {}
@@ -896,11 +896,595 @@ local function PatchDexSource(rawSource)
 		if not nodes then return nil end
 		return nodes[obj]
 	end
+
+	local function _mcpCloneSelectionNodes()
+		local result = {}
+		if not selection or not selection.List then
+			return result
+		end
+		for i = 1,#selection.List do
+			result[#result + 1] = selection.List[i]
+		end
+		return result
+	end
+
+	local function _mcpSetSelectionByNodes(newNodes)
+		if not selection then
+			return
+		end
+		if selection.SetTable then
+			selection:SetTable(newNodes)
+			return
+		end
+		if selection.Clear then
+			selection:Clear()
+		end
+		if selection.Add then
+			for i = 1,#newNodes do
+				selection:Add(newNodes[i])
+			end
+		end
+	end
+
+	local function _mcpResolveNodesForObjects(objects)
+		local resolved = {}
+		for i = 1,#objects do
+			local obj = objects[i]
+			if typeof(obj) ~= "Instance" then
+				continue
+			end
+			local node = nodes and nodes[obj]
+			if node then
+				resolved[#resolved + 1] = node
+			end
+		end
+		return resolved
+	end
+
+	Explorer.__MCP.GetSelectionObjects = function()
+		local result = {}
+		local list = _mcpCloneSelectionNodes()
+		for i = 1,#list do
+			local node = list[i]
+			if typeof(node) == "table" and typeof(node.Obj) == "Instance" then
+				result[#result + 1] = node.Obj
+			end
+		end
+		return result
+	end
+
+	Explorer.__MCP.ClearSelection = function()
+		if selection and selection.Clear then
+			selection:Clear()
+		end
+		return true
+	end
+
+	Explorer.__MCP.SelectObjects = function(objects, mode)
+		mode = mode or "replace"
+		local resolvedNodes = _mcpResolveNodesForObjects(objects or {})
+
+		if mode == "replace" then
+			_mcpSetSelectionByNodes(resolvedNodes)
+		elseif mode == "add" then
+			if selection and selection.Add then
+				for i = 1,#resolvedNodes do
+					if not selection.Map[resolvedNodes[i]] then
+						selection:Add(resolvedNodes[i])
+					end
+				end
+			end
+		elseif mode == "remove" then
+			if selection and selection.Remove then
+				for i = 1,#resolvedNodes do
+					if selection.Map[resolvedNodes[i]] then
+						selection:Remove(resolvedNodes[i])
+					end
+				end
+			else
+				local removeMap = {}
+				for i = 1,#resolvedNodes do
+					removeMap[resolvedNodes[i]] = true
+				end
+				local keep = {}
+				local old = _mcpCloneSelectionNodes()
+				for i = 1,#old do
+					if not removeMap[old[i]] then
+						keep[#keep + 1] = old[i]
+					end
+				end
+				_mcpSetSelectionByNodes(keep)
+			end
+		else
+			return false, "Invalid selection mode: " .. tostring(mode)
+		end
+
+		local current = _mcpCloneSelectionNodes()
+		if #current > 0 then
+			pcall(Explorer.MakeNodeVisible, current[1], true)
+			pcall(Explorer.ViewNode, current[1])
+		end
+		return true, #current
+	end
+
+	Explorer.__MCP.SearchSet = function(query)
+		if Explorer.DoSearch then
+			Explorer.DoSearch(tostring(query or ""))
+		end
+		return true
+	end
+
+	Explorer.__MCP.SearchClear = function()
+		if Explorer.ClearSearch then
+			Explorer.ClearSearch()
+		end
+		return true
+	end
+
+	Explorer.__MCP.ExpandAll = function()
+		local sList = _mcpCloneSelectionNodes()
+		local function recur(node)
+			expanded[node] = true
+			for i = 1,#node do
+				if #node[i] > 0 then
+					recur(node[i])
+				end
+			end
+		end
+		for i = 1,#sList do
+			recur(sList[i])
+		end
+		pcall(Explorer.ForceUpdate)
+		return true, #sList
+	end
+
+	Explorer.__MCP.CollapseAll = function()
+		local sList = _mcpCloneSelectionNodes()
+		local function recur(node)
+			expanded[node] = nil
+			for i = 1,#node do
+				if #node[i] > 0 then
+					recur(node[i])
+				end
+			end
+		end
+		for i = 1,#sList do
+			recur(sList[i])
+		end
+		pcall(Explorer.ForceUpdate)
+		return true, #sList
+	end
+
+	Explorer.__MCP.SelectChildren = function()
+		local sList = _mcpCloneSelectionNodes()
+		local newSelection = {}
+		local count = 1
+		for i = 1,#sList do
+			local node = sList[i]
+			for ind = 1,#node do
+				local cNode = node[ind]
+				if ind == 1 then
+					pcall(Explorer.MakeNodeVisible, cNode, true)
+				end
+				newSelection[count] = cNode
+				count = count + 1
+			end
+		end
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.JumpToParent = function()
+		local sList = _mcpCloneSelectionNodes()
+		local newSelection = {}
+		local count = 1
+		for i = 1,#sList do
+			local node = sList[i]
+			if node.Parent then
+				newSelection[count] = node.Parent
+				count = count + 1
+			end
+		end
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.Rename = function(name)
+		local first = selection and selection.List and selection.List[1]
+		if not first or typeof(first.Obj) ~= "Instance" then
+			return false, "Selection is empty."
+		end
+		name = tostring(name or "")
+		if name == "" then
+			return false, "Rename value is empty."
+		end
+		local ok, err = pcall(function()
+			first.Obj.Name = name
+		end)
+		if not ok then
+			return false, tostring(err)
+		end
+		return true, name
+	end
+
+	Explorer.__MCP.Copy = function()
+		local clone = game.Clone
+		local sList,newClipboard = _mcpCloneSelectionNodes(),{}
+		local count = 1
+		for i = 1,#sList do
+			local inst = sList[i].Obj
+			local s,cloned = pcall(clone,inst)
+			if s and cloned then
+				newClipboard[count] = cloned
+				count = count + 1
+			end
+		end
+		clipboard = newClipboard
+		return true, #newClipboard
+	end
+
+	Explorer.__MCP.Cut = function()
+		local destroy,clone = game.Destroy,game.Clone
+		local sList,newClipboard = _mcpCloneSelectionNodes(),{}
+		local count = 1
+		for i = 1,#sList do
+			local inst = sList[i].Obj
+			local s,cloned = pcall(clone,inst)
+			if s and cloned then
+				newClipboard[count] = cloned
+				count = count + 1
+			end
+			pcall(destroy,inst)
+		end
+		clipboard = newClipboard
+		if selection and selection.Clear then
+			selection:Clear()
+		end
+		return true, #newClipboard
+	end
+
+	Explorer.__MCP.PasteInto = function(targetObjects)
+		local targets = targetObjects or {}
+		if #targets == 0 then
+			local sList = _mcpCloneSelectionNodes()
+			for i = 1,#sList do
+				targets[#targets + 1] = sList[i].Obj
+			end
+		end
+		if #targets == 0 then
+			return false, "No target provided for paste."
+		end
+
+		local newSelection = {}
+		local count = 1
+		for i = 1,#targets do
+			local target = targets[i]
+			for c = 1,#clipboard do
+				local cloned = clipboard[c]:Clone()
+				if cloned then
+					cloned.Parent = target
+					local clonedNode = nodes[cloned]
+					if clonedNode then
+						newSelection[count] = clonedNode
+						count = count + 1
+					end
+				end
+			end
+		end
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.Duplicate = function()
+		local clone = game.Clone
+		local sList = _mcpCloneSelectionNodes()
+		local newSelection = {}
+		local count = 1
+		for i = 1,#sList do
+			local node = sList[i]
+			local inst = node.Obj
+			local instPar = node.Parent and node.Parent.Obj
+			pcall(Explorer.MakeNodeVisible, node, true)
+			local s,cloned = pcall(clone,inst)
+			if s and cloned then
+				cloned.Parent = instPar
+				local clonedNode = nodes[cloned]
+				if clonedNode then
+					newSelection[count] = clonedNode
+					count = count + 1
+				end
+			end
+		end
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.Delete = function()
+		local destroy = game.Destroy
+		local sList = _mcpCloneSelectionNodes()
+		local removed = 0
+		for i = 1,#sList do
+			if pcall(destroy, sList[i].Obj) then
+				removed = removed + 1
+			end
+		end
+		if selection and selection.Clear then
+			selection:Clear()
+		end
+		return true, removed
+	end
+
+	Explorer.__MCP.Group = function()
+		local sList = _mcpCloneSelectionNodes()
+		if #sList == 0 then
+			return false, "Selection is empty."
+		end
+		local model = Instance.new("Model", sList[#sList].Obj.Parent)
+		for i = 1,#sList do
+			pcall(function()
+				sList[i].Obj.Parent = model
+			end)
+		end
+		if nodes[model] then
+			if selection and selection.Set then
+				selection:Set(nodes[model])
+			end
+			pcall(Explorer.ViewNode, nodes[model])
+		end
+		return true, model
+	end
+
+	Explorer.__MCP.Ungroup = function()
+		local newSelection = {}
+		local count = 1
+		local isa = game.IsA
+		local sList = _mcpCloneSelectionNodes()
+
+		local function ungroup(node)
+			local par = node.Parent and node.Parent.Obj
+			if not par then
+				return
+			end
+			local ch = {}
+			for i = 1,#node do
+				local n = node[i]
+				newSelection[count] = n
+				ch[#ch + 1] = n
+				count = count + 1
+			end
+			for i = 1,#ch do
+				pcall(function()
+					ch[i].Obj.Parent = par
+				end)
+			end
+			node.Obj:Destroy()
+		end
+
+		for i = 1,#sList do
+			local v = sList[i]
+			if isa(v.Obj, "Model") then
+				ungroup(v)
+			end
+		end
+
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.Reparent = function(newParent)
+		if typeof(newParent) ~= "Instance" then
+			return false, "newParent is not an Instance."
+		end
+		local sList = _mcpCloneSelectionNodes()
+		local moved = 0
+		for i = 1,#sList do
+			if pcall(function() sList[i].Obj.Parent = newParent end) then
+				moved = moved + 1
+			end
+		end
+		return true, moved
+	end
+
+	Explorer.__MCP.InsertObject = function(className, parentObj)
+		className = tostring(className or "")
+		if className == "" then
+			return false, "className is empty."
+		end
+		local targetParent = parentObj
+		if typeof(targetParent) ~= "Instance" then
+			local sList = _mcpCloneSelectionNodes()
+			targetParent = sList[1] and sList[1].Obj or game
+		end
+		local ok, objOrErr = pcall(Instance.new, className)
+		if not ok then
+			return false, tostring(objOrErr)
+		end
+		objOrErr.Parent = targetParent
+		local node = nodes[objOrErr]
+		if node then
+			_mcpSetSelectionByNodes({node})
+			pcall(Explorer.ViewNode, node)
+		end
+		return true, objOrErr
+	end
+
+	Explorer.__MCP.CopyPath = function()
+		local sList = _mcpCloneSelectionNodes()
+		local paths = {}
+		for i = 1,#sList do
+			paths[#paths + 1] = Explorer.GetInstancePath(sList[i].Obj)
+		end
+		if env.setclipboard and #paths > 0 then
+			if #paths == 1 then
+				env.setclipboard(paths[1])
+			else
+				local lines = {"{"}
+				for i = 1,#paths do
+					lines[#lines + 1] = "\t" .. paths[i] .. ","
+				end
+				lines[#lines + 1] = "}"
+				env.setclipboard(table.concat(lines, "\n"))
+			end
+		end
+		return true, paths
+	end
+
+	Explorer.__MCP.TeleportTo = function()
+		local sList = _mcpCloneSelectionNodes()
+		local isa = game.IsA
+		local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if not hrp then
+			return false, "HumanoidRootPart is unavailable."
+		end
+		for i = 1,#sList do
+			local node = sList[i]
+			if isa(node.Obj, "BasePart") then
+				hrp.CFrame = node.Obj.CFrame + Settings.Explorer.TeleportToOffset
+				return true, node.Obj
+			elseif isa(node.Obj, "Model") then
+				if node.Obj.PrimaryPart then
+					hrp.CFrame = node.Obj.PrimaryPart.CFrame + Settings.Explorer.TeleportToOffset
+					return true, node.Obj.PrimaryPart
+				end
+				local part = node.Obj:FindFirstChildWhichIsA("BasePart", true)
+				if part then
+					hrp.CFrame = part.CFrame + Settings.Explorer.TeleportToOffset
+					return true, part
+				end
+			end
+		end
+		return false, "No BasePart/Model target in selection."
+	end
+
+	Explorer.__MCP.ViewObject = function()
+		local sList = _mcpCloneSelectionNodes()
+		local isa = game.IsA
+		for i = 1,#sList do
+			local node = sList[i]
+			if isa(node.Obj, "BasePart") or isa(node.Obj, "Model") then
+				workspace.CurrentCamera.CameraSubject = node.Obj
+				return true, node.Obj
+			end
+		end
+		return false, "No BasePart/Model target in selection."
+	end
+
+	Explorer.__MCP.ViewScript = function()
+		local scr = selection and selection.List and selection.List[1] and selection.List[1].Obj
+		if scr and ScriptViewer and ScriptViewer.ViewScript then
+			ScriptViewer.ViewScript(scr)
+			return true, scr
+		end
+		return false, "No script selected."
+	end
+
+	Explorer.__MCP.SelectCharacter = function()
+		local newSelection = {}
+		local count = 1
+		local sList = _mcpCloneSelectionNodes()
+		local isa = game.IsA
+		for i = 1,#sList do
+			local node = sList[i]
+			if isa(node.Obj, "Player") and nodes[node.Obj.Character] then
+				newSelection[count] = nodes[node.Obj.Character]
+				count = count + 1
+			end
+		end
+		_mcpSetSelectionByNodes(newSelection)
+		if #newSelection > 0 then
+			pcall(Explorer.ViewNode, newSelection[1])
+		end
+		return true, #newSelection
+	end
+
+	Explorer.__MCP.RefreshNil = function()
+		if Explorer.RefreshNilInstances then
+			Explorer.RefreshNilInstances()
+		end
+		return true
+	end
+
+	Explorer.__MCP.HideNil = function()
+		if Explorer.HideNilInstances then
+			Explorer.HideNilInstances()
+		end
+		return true
+	end
+
+	Explorer.__MCP.CallFunction = function(args)
+		local first = selection and selection.List and selection.List[1] and selection.List[1].Obj
+		if typeof(first) ~= "Instance" then
+			return false, "No selected instance."
+		end
+		args = args or {}
+		if first:IsA("BindableFunction") then
+			local ok, result = pcall(function()
+				return first:Invoke(unpack(args))
+			end)
+			return ok, result
+		end
+		if first:IsA("RemoteFunction") then
+			local ok, result = pcall(function()
+				return first:InvokeServer(unpack(args))
+			end)
+			return ok, result
+		end
+		return false, "Selected object is not callable."
+	end
+
+	Explorer.__MCP.GetLuaReferences = function()
+		return true, {}
+	end
+
+	Explorer.__MCP.SaveInstance = function(filePath)
+		if not writefile then
+			return false, "writefile is unavailable."
+		end
+		local targets = Explorer.__MCP.GetSelectionObjects()
+		if #targets == 0 then
+			return false, "Selection is empty."
+		end
+		local lines = {}
+		for i = 1,#targets do
+			lines[#lines + 1] = Explorer.GetInstancePath(targets[i])
+		end
+		local resolved = tostring(filePath or ("dex/saved/selection_paths_" .. tostring(os.time()) .. ".txt"))
+		writefile(resolved, table.concat(lines, "\n"))
+		return true, resolved
+	end
+
+	Explorer.__MCP.ViewConnections = function()
+		return true, {}
+	end
+
+	Explorer.__MCP.ViewAPI = function()
+		local first = selection and selection.List and selection.List[1] and selection.List[1].Obj
+		if typeof(first) ~= "Instance" then
+			return false, "No selected instance."
+		end
+		local classData = API and API.Classes and API.Classes[first.ClassName]
+		return true, classData
+	end
 ]]
 
     local propertiesBridgeSnippet = [[
 	Properties.__MCP = Properties.__MCP or {}
-	Properties.__MCP.Version = "dex-bridge-1"
+	Properties.__MCP.Version = "dex-bridge-2"
 
 	Properties.__MCP.BuildRowsForObject = function(obj, options)
 		options = options or {}
@@ -974,42 +1558,348 @@ local function PatchDexSource(rawSource)
 
 		return rows, nil
 	end
+
+	local function _mcpWithTempSelection(obj, callback)
+		if typeof(obj) ~= "Instance" then
+			return false, "Target object is not an Instance."
+		end
+		if not Explorer or not Explorer.Selection then
+			return false, "Explorer selection is unavailable."
+		end
+
+		local selectionRef = Explorer.Selection
+		local oldList = selectionRef.List
+		local oldMap = selectionRef.Map
+		local tempNode = (Explorer.__MCP and Explorer.__MCP.GetNodeForObject and Explorer.__MCP.GetNodeForObject(obj)) or {Obj = obj, Class = obj.ClassName}
+		selectionRef.List = {tempNode}
+		selectionRef.Map = {[tempNode] = true}
+
+		local ok, a, b = pcall(callback, tempNode)
+
+		selectionRef.List = oldList
+		selectionRef.Map = oldMap
+		pcall(function()
+			Properties.ShowExplorerProps()
+		end)
+
+		if not ok then
+			return false, tostring(a)
+		end
+		return true, a, b
+	end
+
+	local function _mcpParsePropertyValue(prop, payload)
+		payload = payload or {}
+		if payload.clear == true then
+			return nil, true
+		end
+		if payload.value ~= nil then
+			return payload.value, true
+		end
+
+		local raw = payload.valueRaw
+		if raw == nil then
+			return nil, false
+		end
+
+		if typeof(raw) ~= "string" then
+			return raw, true
+		end
+
+		local parsed = Properties.StringToValue(prop, raw)
+		if parsed ~= nil then
+			return parsed, true
+		end
+
+		local enumClass, enumItem = string.match(raw, "^Enum%.([%w_]+)%.([%w_]+)$")
+		if enumClass and enumItem and Enum[enumClass] and Enum[enumClass][enumItem] then
+			return Enum[enumClass][enumItem], true
+		end
+
+		local vec3 = string.match(raw, "^Vector3%((.*)%)$")
+		if vec3 then
+			local vals = string.split(vec3, ",")
+			local x = tonumber(vals[1]); local y = tonumber(vals[2]); local z = tonumber(vals[3])
+			if x and y and z then
+				return Vector3.new(x, y, z), true
+			end
+		end
+
+		local vec2 = string.match(raw, "^Vector2%((.*)%)$")
+		if vec2 then
+			local vals = string.split(vec2, ",")
+			local x = tonumber(vals[1]); local y = tonumber(vals[2])
+			if x and y then
+				return Vector2.new(x, y), true
+			end
+		end
+
+		local udim = string.match(raw, "^UDim%((.*)%)$")
+		if udim then
+			local vals = string.split(udim, ",")
+			local s = tonumber(vals[1]); local o = tonumber(vals[2])
+			if s and o then
+				return UDim.new(s, o), true
+			end
+		end
+
+		local udim2 = string.match(raw, "^UDim2%((.*)%)$")
+		if udim2 then
+			local vals = string.split(udim2, ",")
+			local xScale = tonumber(vals[1]); local xOffset = tonumber(vals[2])
+			local yScale = tonumber(vals[3]); local yOffset = tonumber(vals[4])
+			if xScale and xOffset and yScale and yOffset then
+				return UDim2.new(xScale, xOffset, yScale, yOffset), true
+			end
+		end
+
+		local rgb = string.match(raw, "^Color3%.fromRGB%((.*)%)$")
+		if rgb then
+			local vals = string.split(rgb, ",")
+			local r = tonumber(vals[1]); local g = tonumber(vals[2]); local b = tonumber(vals[3])
+			if r and g and b then
+				return Color3.fromRGB(r, g, b), true
+			end
+		end
+
+		local hint = tostring(payload.valueTypeHint or "")
+		if hint == "number" then
+			local num = tonumber(raw)
+			if num ~= nil then
+				return num, true
+			end
+		elseif hint == "boolean" then
+			if raw == "true" then return true, true end
+			if raw == "false" then return false, true end
+		end
+
+		return nil, false
+	end
+
+	Properties.__MCP.ResolveProperty = function(obj, propName)
+		propName = tostring(propName or "")
+		if propName == "" then
+			return nil, "Property name is empty."
+		end
+
+		local ok, propOrErr = _mcpWithTempSelection(obj, function()
+			Properties.ShowExplorerProps()
+			local needle = string.lower(propName)
+			for i = 1,#viewList do
+				local prop = viewList[i]
+				if prop and not prop.CategoryName and not prop.SpecialRow then
+					local n1 = string.lower(tostring(prop.Name or ""))
+					local n2 = string.lower(tostring(prop.DisplayName or ""))
+					if n1 == needle or n2 == needle then
+						return prop
+					end
+				end
+			end
+			return nil
+		end)
+
+		if not ok then
+			return nil, tostring(propOrErr)
+		end
+		if not propOrErr then
+			return nil, "Property not found: " .. propName
+		end
+		return propOrErr, nil
+	end
+
+	Properties.__MCP.SetProperty = function(obj, propName, payload)
+		local prop, err = Properties.__MCP.ResolveProperty(obj, propName)
+		if not prop then
+			return false, err
+		end
+
+		local setValue, parsed = _mcpParsePropertyValue(prop, payload)
+		if not parsed then
+			return false, "Unable to parse value for property '" .. tostring(propName) .. "'."
+		end
+
+		local ok, setErr = _mcpWithTempSelection(obj, function()
+			Properties.SetProp(prop, setValue)
+		end)
+		if not ok then
+			return false, tostring(setErr)
+		end
+		return true
+	end
+
+	Properties.__MCP.SetPropertiesBatch = function(obj, patches)
+		local applied = 0
+		local errors = {}
+		for i = 1,#patches do
+			local patch = patches[i]
+			local ok, err = Properties.__MCP.SetProperty(obj, patch.name, patch)
+			if ok then
+				applied = applied + 1
+			else
+				errors[#errors + 1] = {index = i, name = patch.name, error = tostring(err)}
+			end
+		end
+		return applied, errors
+	end
+
+	Properties.__MCP.SearchSet = function(text)
+		Properties.SearchText = tostring(text or "")
+		Properties.Update()
+		Properties.Refresh()
+		return true
+	end
+
+	Properties.__MCP.SearchClear = function()
+		Properties.SearchText = ""
+		Properties.Update()
+		Properties.Refresh()
+		return true
+	end
+
+	Properties.__MCP.ExpandCategory = function(categoryName, setExpanded)
+		categoryName = tostring(categoryName or "")
+		if categoryName == "" then
+			return false, "categoryName is empty."
+		end
+		expanded["CAT_" .. categoryName] = (setExpanded ~= false) and true or nil
+		Properties.Update()
+		Properties.Refresh()
+		return true
+	end
+
+	Properties.__MCP.ExpandProperty = function(fullName, setExpanded)
+		fullName = tostring(fullName or "")
+		if fullName == "" then
+			return false, "fullName is empty."
+		end
+		expanded[fullName] = (setExpanded ~= false) and true or nil
+		Properties.Update()
+		Properties.Refresh()
+		return true
+	end
+
+	Properties.__MCP.AttributeUpsert = function(obj, attributeName, attributeValue)
+		attributeName = tostring(attributeName or "")
+		if attributeName == "" then
+			return false, "Attribute name is empty."
+		end
+		local ok, err = pcall(function()
+			obj:SetAttribute(attributeName, attributeValue)
+		end)
+		if not ok then
+			return false, tostring(err)
+		end
+		Properties.ShowExplorerProps()
+		return true
+	end
+
+	Properties.__MCP.AttributeRemove = function(obj, attributeName)
+		attributeName = tostring(attributeName or "")
+		if attributeName == "" then
+			return false, "Attribute name is empty."
+		end
+		local ok, err = pcall(function()
+			obj:SetAttribute(attributeName, nil)
+		end)
+		if not ok then
+			return false, tostring(err)
+		end
+		Properties.ShowExplorerProps()
+		return true
+	end
+
+	Properties.__MCP.ToggleAttributesVisibility = function(visible)
+		if visible == nil then
+			Settings.Properties.ShowAttributes = not Settings.Properties.ShowAttributes
+		else
+			Settings.Properties.ShowAttributes = visible == true
+		end
+		Properties.ShowExplorerProps()
+		return true, Settings.Properties.ShowAttributes
+	end
+
+	Properties.__MCP.SoundPreview = function(mode, soundObj)
+		mode = tostring(mode or "stop")
+		if mode == "play" then
+			if typeof(soundObj) ~= "Instance" or not soundObj:IsA("Sound") then
+				return false, "soundObj must be a Sound instance."
+			end
+			Properties.SetSoundPreview(soundObj)
+			return true
+		end
+		if mode == "pause" or mode == "stop" then
+			Properties.SetSoundPreview(false)
+			return true
+		end
+		return false, "Unknown sound preview mode: " .. mode
+	end
 ]]
 
     local scriptViewerBridgeSnippet = [[
 	local __mcpOriginalViewScript = ScriptViewer.ViewScript
 	ScriptViewer.__MCP = ScriptViewer.__MCP or {}
-	ScriptViewer.__MCP.Version = "dex-bridge-1"
+	ScriptViewer.__MCP.Version = "dex-bridge-2"
 	ScriptViewer.__MCP.LastScript = nil
 	ScriptViewer.__MCP.LastSource = nil
 
-	ScriptViewer.ViewScript = function(scr)
-		ScriptViewer.__MCP.LastScript = scr
-		__mcpOriginalViewScript(scr)
+	local function _mcpCaptureCurrentText()
 		if codeFrame then
 			local okText, textValue = pcall(function()
 				return codeFrame:GetText()
 			end)
 			if okText and typeof(textValue) == "string" then
 				ScriptViewer.__MCP.LastSource = textValue
-			end
-		end
-	end
-
-	ScriptViewer.__MCP.GetCurrentText = function()
-		if codeFrame then
-			local okText, textValue = pcall(function()
-				return codeFrame:GetText()
-			end)
-			if okText and typeof(textValue) == "string" then
 				return textValue
 			end
 		end
 		return ScriptViewer.__MCP.LastSource
 	end
 
+	ScriptViewer.ViewScript = function(scr)
+		ScriptViewer.__MCP.LastScript = scr
+		__mcpOriginalViewScript(scr)
+		_mcpCaptureCurrentText()
+	end
+
+	ScriptViewer.__MCP.OpenScript = function(scr)
+		if typeof(scr) ~= "Instance" or not scr:IsA("LuaSourceContainer") then
+			return false, "Target must be a LuaSourceContainer."
+		end
+		ScriptViewer.ViewScript(scr)
+		return true
+	end
+
+	ScriptViewer.__MCP.GetCurrentText = function()
+		return _mcpCaptureCurrentText()
+	end
+
 	ScriptViewer.__MCP.GetCurrentScript = function()
 		return ScriptViewer.__MCP.LastScript
+	end
+
+	ScriptViewer.__MCP.CopyCurrentText = function()
+		if not setclipboard then
+			return false, "setclipboard is unavailable."
+		end
+		local source = ScriptViewer.__MCP.GetCurrentText()
+		if typeof(source) ~= "string" or source == "" then
+			return false, "Script Viewer buffer is empty."
+		end
+		setclipboard(source)
+		return true, #source
+	end
+
+	ScriptViewer.__MCP.SaveCurrentText = function(filePath)
+		if not writefile then
+			return false, "writefile is unavailable."
+		end
+		local source = ScriptViewer.__MCP.GetCurrentText()
+		if typeof(source) ~= "string" or source == "" then
+			return false, "Script Viewer buffer is empty."
+		end
+		local resolvedPath = tostring(filePath or ("dex/saved/script_viewer_" .. tostring(os.time()) .. ".lua"))
+		writefile(resolvedPath, source)
+		return true, resolvedPath
 	end
 ]]
 
@@ -1054,6 +1944,7 @@ do
 	__bridge.version = %q
 	__bridge.main = Main
 	__bridge.apps = Main and Main.Apps or nil
+	__bridge.settings = Settings
 	__bridge.api = API
 	__bridge.rmd = RMD
 
@@ -1072,6 +1963,156 @@ do
 	__bridge.ready = __ready
 	__bridge.status = __ready and "ready" or "fallback"
 	__bridge.message = __ready and "Dex bridge initialized." or "Dex loaded, but bridge hooks were only partially initialized."
+
+	__bridge.mainMCP = __bridge.mainMCP or {}
+	local __mainMCP = __bridge.mainMCP
+
+	local function __mcpResolveAppName(name)
+		name = tostring(name or "")
+		if name == "Explorer" then
+			return "Explorer"
+		end
+		if name == "Properties" then
+			return "Properties"
+		end
+		if name == "Script Viewer" or name == "ScriptViewer" or name == "Script_Viewer" then
+			return "Script Viewer"
+		end
+		return nil
+	end
+
+	__mainMCP.GetMenuOpen = function()
+		if not Main or not Main.MainGui then
+			return nil
+		end
+		local openButton = Main.MainGui:FindFirstChild("OpenButton")
+		if not openButton then
+			return nil
+		end
+		return tostring(openButton.Text or "") == "X"
+	end
+
+	__mainMCP.SetMenuOpen = function(open)
+		if not Main or typeof(Main.SetMainGuiOpen) ~= "function" then
+			return false, "Main.SetMainGuiOpen is unavailable."
+		end
+		Main.SetMainGuiOpen(open == true)
+		return true, __mainMCP.GetMenuOpen()
+	end
+
+	__mainMCP.SetAppOpen = function(appName, open)
+		if not Main or typeof(Main.MenuApps) ~= "table" then
+			return false, "Main menu app controls are unavailable."
+		end
+		local resolved = __mcpResolveAppName(appName)
+		if not resolved then
+			return false, "Unknown app name."
+		end
+		local control = Main.MenuApps[resolved]
+		if typeof(control) ~= "table" then
+			return false, "App control is unavailable: " .. tostring(resolved)
+		end
+		if open == true then
+			if typeof(control.Enable) ~= "function" then
+				return false, "Enable handler is unavailable for app: " .. tostring(resolved)
+			end
+			control.Enable()
+		else
+			if typeof(control.Disable) ~= "function" then
+				return false, "Disable handler is unavailable for app: " .. tostring(resolved)
+			end
+			control.Disable()
+		end
+		return true, resolved
+	end
+
+	__mainMCP.FocusWindow = function(appName)
+		local resolved = __mcpResolveAppName(appName)
+		if not resolved then
+			return false, "Unknown app name."
+		end
+
+		local appObj
+		if resolved == "Explorer" then
+			appObj = __explorer
+		elseif resolved == "Properties" then
+			appObj = __properties
+		else
+			appObj = __scriptViewer
+		end
+
+		local window = appObj and appObj.Window
+		if not window then
+			return false, "Window is unavailable for app: " .. tostring(resolved)
+		end
+
+		if typeof(window.ShowAndFocus) == "function" then
+			window:ShowAndFocus()
+		elseif typeof(window.Show) == "function" then
+			window:Show()
+		else
+			return false, "Window focus/show handlers are unavailable for app: " .. tostring(resolved)
+		end
+		return true, resolved
+	end
+
+	__mainMCP.GetSettings = function(path)
+		if typeof(Settings) ~= "table" then
+			return nil, "Dex Settings table is unavailable."
+		end
+		if path == nil or path == "" then
+			return Settings
+		end
+
+		local cur = Settings
+		local parts = string.split(tostring(path), ".")
+		for i = 1,#parts do
+			local key = parts[i]
+			if typeof(cur) ~= "table" then
+				return nil, "Invalid settings path at '" .. tostring(key) .. "'."
+			end
+			cur = cur[key]
+			if cur == nil then
+				return nil, "Settings path not found: " .. tostring(path)
+			end
+		end
+		return cur
+	end
+
+	__mainMCP.SetSetting = function(path, value)
+		path = tostring(path or "")
+		if path == "" then
+			return false, "Settings path is empty."
+		end
+		if typeof(Settings) ~= "table" then
+			return false, "Dex Settings table is unavailable."
+		end
+
+		local parts = string.split(path, ".")
+		if #parts == 0 then
+			return false, "Settings path is invalid."
+		end
+
+		local cur = Settings
+		for i = 1,#parts - 1 do
+			local key = parts[i]
+			if typeof(cur[key]) ~= "table" then
+				return false, "Settings path is invalid at '" .. tostring(key) .. "'."
+			end
+			cur = cur[key]
+		end
+
+		cur[parts[#parts]] = value
+		return true
+	end
+
+	__mainMCP.ResetSettings = function()
+		if not Main or typeof(Main.ResetSettings) ~= "function" then
+			return false, "Main.ResetSettings is unavailable."
+		end
+		Main.ResetSettings()
+		return true
+	end
 end
 ]], DEX_BRIDGE_KEY, DEX_BRIDGE_KEY, DEX_BRIDGE_VERSION)
 
@@ -1313,6 +2354,1106 @@ local function BuildFallbackPropertyRows(target, search, includeTags)
     end
 
     return rows
+end
+
+local DEX_ACTIONS = {
+    "explorer.select.replace",
+    "explorer.select.add",
+    "explorer.select.remove",
+    "explorer.select.clear",
+    "explorer.search.set",
+    "explorer.search.clear",
+    "explorer.expand.all",
+    "explorer.collapse.all",
+    "explorer.jump_to_parent",
+    "explorer.select_children",
+    "explorer.rename",
+    "explorer.cut",
+    "explorer.copy",
+    "explorer.paste_into",
+    "explorer.duplicate",
+    "explorer.delete",
+    "explorer.group",
+    "explorer.ungroup",
+    "explorer.reparent",
+    "explorer.insert_object",
+    "explorer.copy_path",
+    "explorer.call_function",
+    "explorer.get_lua_references",
+    "explorer.save_instance",
+    "explorer.view_connections",
+    "explorer.view_api",
+    "explorer.view_object",
+    "explorer.view_script",
+    "explorer.select_character",
+    "explorer.refresh_nil",
+    "explorer.hide_nil.toggle",
+    "explorer.teleport_to",
+    "properties.select_target",
+    "properties.search.set",
+    "properties.search.clear",
+    "properties.set",
+    "properties.set_batch",
+    "properties.clear_value",
+    "properties.expand_category",
+    "properties.expand_property",
+    "properties.attributes.add",
+    "properties.attributes.edit",
+    "properties.attributes.remove",
+    "properties.attributes.toggle_visibility",
+    "properties.sound_preview.play",
+    "properties.sound_preview.pause",
+    "properties.sound_preview.stop",
+    "script_viewer.open",
+    "script_viewer.get_text",
+    "script_viewer.copy_text",
+    "script_viewer.save_to_file",
+    "main.menu.set_open",
+    "main.app.set_open",
+    "main.window.focus",
+    "main.settings.get",
+    "main.settings.set",
+    "main.settings.reset",
+}
+
+local DEX_ACTION_SET = {}
+for i = 1,#DEX_ACTIONS do
+    DEX_ACTION_SET[DEX_ACTIONS[i]] = true
+end
+
+local DEX_ACTION_PAYLOAD_KEYS = {
+    ["explorer.rename"] = {"name"},
+    ["explorer.insert_object"] = {"className"},
+    ["explorer.call_function"] = {"args"},
+    ["explorer.save_instance"] = {"filePath"},
+    ["explorer.reparent"] = {"newParentPath"},
+    ["explorer.search.set"] = {"query"},
+    ["properties.search.set"] = {"query"},
+    ["properties.set"] = {"name", "value|valueRaw"},
+    ["properties.set_batch"] = {"patches"},
+    ["properties.clear_value"] = {"name"},
+    ["properties.expand_category"] = {"categoryName"},
+    ["properties.expand_property"] = {"fullName"},
+    ["properties.attributes.add"] = {"name", "value"},
+    ["properties.attributes.edit"] = {"name", "value"},
+    ["properties.attributes.remove"] = {"name"},
+    ["properties.attributes.toggle_visibility"] = {"visible?"},
+    ["script_viewer.save_to_file"] = {"filePath?"},
+    ["main.menu.set_open"] = {"open"},
+    ["main.app.set_open"] = {"appName", "open"},
+    ["main.window.focus"] = {"appName"},
+    ["main.settings.get"] = {"path?"},
+    ["main.settings.set"] = {"path", "value"},
+}
+
+local DEX_WRITE_ACTION_SET = {
+    ["explorer.select.replace"] = true,
+    ["explorer.select.add"] = true,
+    ["explorer.select.remove"] = true,
+    ["explorer.select.clear"] = true,
+    ["explorer.search.set"] = true,
+    ["explorer.search.clear"] = true,
+    ["explorer.expand.all"] = true,
+    ["explorer.collapse.all"] = true,
+    ["explorer.jump_to_parent"] = true,
+    ["explorer.select_children"] = true,
+    ["explorer.rename"] = true,
+    ["explorer.cut"] = true,
+    ["explorer.copy"] = true,
+    ["explorer.paste_into"] = true,
+    ["explorer.duplicate"] = true,
+    ["explorer.delete"] = true,
+    ["explorer.group"] = true,
+    ["explorer.ungroup"] = true,
+    ["explorer.reparent"] = true,
+    ["explorer.insert_object"] = true,
+    ["explorer.copy_path"] = true,
+    ["explorer.call_function"] = true,
+    ["explorer.get_lua_references"] = true,
+    ["explorer.save_instance"] = true,
+    ["explorer.view_connections"] = true,
+    ["explorer.view_api"] = true,
+    ["explorer.view_object"] = true,
+    ["explorer.view_script"] = true,
+    ["explorer.select_character"] = true,
+    ["explorer.refresh_nil"] = true,
+    ["explorer.hide_nil.toggle"] = true,
+    ["explorer.teleport_to"] = true,
+    ["properties.select_target"] = true,
+    ["properties.search.set"] = true,
+    ["properties.search.clear"] = true,
+    ["properties.set"] = true,
+    ["properties.set_batch"] = true,
+    ["properties.clear_value"] = true,
+    ["properties.expand_category"] = true,
+    ["properties.expand_property"] = true,
+    ["properties.attributes.add"] = true,
+    ["properties.attributes.edit"] = true,
+    ["properties.attributes.remove"] = true,
+    ["properties.attributes.toggle_visibility"] = true,
+    ["properties.sound_preview.play"] = true,
+    ["properties.sound_preview.pause"] = true,
+    ["properties.sound_preview.stop"] = true,
+    ["script_viewer.open"] = true,
+    ["script_viewer.copy_text"] = true,
+    ["script_viewer.save_to_file"] = true,
+    ["main.menu.set_open"] = true,
+    ["main.app.set_open"] = true,
+    ["main.window.focus"] = true,
+    ["main.settings.set"] = true,
+    ["main.settings.reset"] = true,
+}
+
+local function IsDexWriteAction(action)
+    return DEX_WRITE_ACTION_SET[action] == true
+end
+
+local function GetDexBridgeModules()
+    local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+    local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+    local apps = bridge and bridge.apps
+    local explorer = apps and apps.Explorer
+    local properties = apps and apps.Properties
+    local scriptViewer = apps and apps.ScriptViewer
+    local mainMCP = bridge and bridge.mainMCP
+    return {
+        bridge = bridge,
+        bridgeReady = bridgeReady,
+        bridgeStatus = bridgeStatus,
+        bridgeMessage = bridgeMessage,
+        apps = apps,
+        explorer = explorer,
+        explorerMCP = explorer and explorer.__MCP,
+        properties = properties,
+        propertiesMCP = properties and properties.__MCP,
+        scriptViewer = scriptViewer,
+        scriptViewerMCP = scriptViewer and scriptViewer.__MCP,
+        mainMCP = mainMCP,
+    }
+end
+
+local function CaptureDexSnapshot()
+    local modules = GetDexBridgeModules()
+    local mainMenu, location = FindDexMainMenu()
+    local menuOpen, menuButtonText = GetDexMenuOpenState(mainMenu)
+
+    local selectionCount = 0
+    local searchText = ""
+    if typeof(modules.explorerMCP) == "table" and typeof(modules.explorerMCP.GetSelectionCount) == "function" then
+        local okCount, count = pcall(modules.explorerMCP.GetSelectionCount)
+        if okCount and tonumber(count) then
+            selectionCount = tonumber(count)
+        end
+    end
+    if typeof(modules.explorerMCP) == "table" and typeof(modules.explorerMCP.GetSearchText) == "function" then
+        local okSearch, value = pcall(modules.explorerMCP.GetSearchText)
+        if okSearch and typeof(value) == "string" then
+            searchText = value
+        end
+    end
+
+    return {
+        loaded = mainMenu ~= nil,
+        location = location,
+        menuOpen = menuOpen,
+        menuButtonText = menuButtonText,
+        selectionCount = selectionCount,
+        searchText = searchText,
+        bridgeReady = modules.bridgeReady,
+        bridgeStatus = modules.bridgeStatus,
+        bridgeVersion = modules.bridge and modules.bridge.version or nil,
+    }
+end
+
+local function DidSnapshotChange(before, after)
+    if not before or not after then
+        return false
+    end
+    return before.loaded ~= after.loaded
+        or before.location ~= after.location
+        or before.menuOpen ~= after.menuOpen
+        or before.menuButtonText ~= after.menuButtonText
+        or before.selectionCount ~= after.selectionCount
+        or before.searchText ~= after.searchText
+        or before.bridgeReady ~= after.bridgeReady
+        or before.bridgeStatus ~= after.bridgeStatus
+end
+
+local function BuildDexActionResult(action, changed, message, modules, data, beforeSnapshot, afterSnapshot, errorCode)
+    local status = errorCode and "error" or "ok"
+    return {
+        status = status,
+        action = action,
+        changed = changed == true,
+        bridgeReady = modules.bridgeReady,
+        bridgeStatus = modules.bridgeStatus,
+        message = tostring(message or ""),
+        data = data,
+        before = beforeSnapshot,
+        after = afterSnapshot,
+        errorCode = errorCode,
+    }
+end
+
+local function BuildDexActionError(action, errorCode, message, modules, beforeSnapshot, returnSnapshot, nextStep)
+    local data = {}
+    if typeof(nextStep) == "string" and nextStep ~= "" then
+        data.nextStep = nextStep
+    end
+    local afterSnapshot = returnSnapshot and CaptureDexSnapshot() or nil
+    return BuildDexActionResult(action, false, message, modules, data, beforeSnapshot, afterSnapshot, errorCode)
+end
+
+local function SummarizeInstance(obj)
+    if typeof(obj) ~= "Instance" then
+        return nil
+    end
+    local debugId = nil
+    local okDebug, debugValue = pcall(function()
+        return obj:GetDebugId()
+    end)
+    if okDebug then
+        debugId = debugValue
+    end
+    return {
+        name = obj.Name,
+        className = obj.ClassName,
+        path = SafePathFromInstance(obj),
+        debugId = debugId,
+    }
+end
+
+local function GetSelectedObjectsForAction(modules)
+    local explorerMCP = modules.explorerMCP
+    if typeof(explorerMCP) ~= "table" or typeof(explorerMCP.GetSelectionObjects) ~= "function" then
+        return nil, "Dex selection API is unavailable."
+    end
+    local okSelection, objectsOrErr = pcall(explorerMCP.GetSelectionObjects)
+    if not okSelection or typeof(objectsOrErr) ~= "table" then
+        return nil, "Failed to read Dex selection."
+    end
+    return objectsOrErr, nil
+end
+
+local function ResolveObjectsFromActionRequest(req, modules, options)
+    options = options or {}
+    local allowEmpty = options.allowEmpty == true
+    local fallbackToSelection = options.fallbackToSelection == true
+
+    local objects = {}
+
+    if typeof(req.instancePaths) == "table" and #req.instancePaths > 0 then
+        for i = 1,#req.instancePaths do
+            local rawPath = req.instancePaths[i]
+            if typeof(rawPath) ~= "string" or rawPath == "" then
+                return nil, "instancePaths contains an empty value."
+            end
+            local obj, err = ResolveInstancePath(rawPath)
+            if not obj then
+                return nil, err
+            end
+            objects[#objects + 1] = obj
+        end
+    elseif typeof(req.instancePath) == "string" and req.instancePath ~= "" then
+        local obj, err = ResolveInstancePath(req.instancePath)
+        if not obj then
+            return nil, err
+        end
+        objects[#objects + 1] = obj
+    elseif typeof(req.selectionIndices) == "table" and #req.selectionIndices > 0 then
+        local selected, selErr = GetSelectedObjectsForAction(modules)
+        if not selected then
+            return nil, selErr
+        end
+        for i = 1,#req.selectionIndices do
+            local idx = ClampInt(req.selectionIndices[i], 1, math.max(1, #selected), 1)
+            local obj = selected[idx]
+            if typeof(obj) == "Instance" then
+                objects[#objects + 1] = obj
+            end
+        end
+    elseif req.selectionIndex ~= nil then
+        local selected, selErr = GetSelectedObjectsForAction(modules)
+        if not selected then
+            return nil, selErr
+        end
+        if #selected == 0 then
+            return nil, "Dex selection is empty."
+        end
+        local idx = ClampInt(req.selectionIndex, 1, #selected, 1)
+        local obj = selected[idx]
+        if typeof(obj) == "Instance" then
+            objects[#objects + 1] = obj
+        end
+    elseif fallbackToSelection then
+        local selected, selErr = GetSelectedObjectsForAction(modules)
+        if not selected then
+            return nil, selErr
+        end
+        for i = 1,#selected do
+            if typeof(selected[i]) == "Instance" then
+                objects[#objects + 1] = selected[i]
+            end
+        end
+    end
+
+    if #objects == 0 and not allowEmpty then
+        return nil, "No target instances resolved. Provide instancePath/instancePaths or select a target in Dex."
+    end
+
+    return objects, nil
+end
+
+local function EnsureBridgeMethod(container, methodName, subsystemLabel)
+    if typeof(container) ~= "table" or typeof(container[methodName]) ~= "function" then
+        return nil, subsystemLabel .. " bridge method '" .. tostring(methodName) .. "' is unavailable."
+    end
+    return container[methodName], nil
+end
+
+local function ExecuteDexAction(req)
+    local action = tostring(req.action or "")
+    local options = req.options or {}
+    local returnSnapshot = options.returnSnapshot ~= false
+    local requireBridgeReady = options.requireBridgeReady ~= false
+    local payload = req.payload or {}
+    if typeof(payload) ~= "table" then
+        payload = {}
+    end
+
+    local modules = GetDexBridgeModules()
+    local beforeSnapshot = returnSnapshot and CaptureDexSnapshot() or nil
+
+    if action == "" then
+        return BuildDexActionError(
+            action,
+            "invalid_action",
+            "action is required.",
+            modules,
+            beforeSnapshot,
+            returnSnapshot,
+            "Choose an action from dex-list-capabilities."
+        )
+    end
+    if not DEX_ACTION_SET[action] then
+        return BuildDexActionError(
+            action,
+            "invalid_action",
+            "Unsupported action: " .. action,
+            modules,
+            beforeSnapshot,
+            returnSnapshot,
+            "Call dex-list-capabilities to inspect supported actions."
+        )
+    end
+    if requireBridgeReady and not modules.bridgeReady then
+        return BuildDexActionError(
+            action,
+            "bridge_not_ready",
+            "Dex bridge is not ready.",
+            modules,
+            beforeSnapshot,
+            returnSnapshot,
+            "Call ensure-dex first, then retry."
+        )
+    end
+    if IsDexWriteAction(action) and not modules.bridgeReady then
+        return BuildDexActionError(
+            action,
+            "bridge_not_ready",
+            "This action requires bridgeStatus=ready.",
+            modules,
+            beforeSnapshot,
+            returnSnapshot,
+            "Call ensure-dex and confirm bridgeStatus=ready."
+        )
+    end
+
+    local changed = false
+    local message = "Action completed."
+    local data = {}
+
+    if string.sub(action, 1, 9) == "explorer." then
+        local explorerMCP = modules.explorerMCP
+        if typeof(explorerMCP) ~= "table" then
+            return BuildDexActionError(action, "bridge_not_ready", "Dex Explorer bridge is unavailable.", modules, beforeSnapshot, returnSnapshot, "Call ensure-dex again.")
+        end
+
+        if action == "explorer.select.replace" or action == "explorer.select.add" or action == "explorer.select.remove" then
+            local mode = string.sub(action, 17)
+            local selectMethod, methodErr = EnsureBridgeMethod(explorerMCP, "SelectObjects", "Explorer")
+            if not selectMethod then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "Re-run ensure-dex.")
+            end
+            local objects, resolveErr = ResolveObjectsFromActionRequest(req, modules, {allowEmpty = false})
+            if not objects then
+                return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "Provide instancePath or choose a Dex selection.")
+            end
+            local okCall, methodResult = pcall(selectMethod, objects, mode)
+            if not okCall then
+                return BuildDexActionError(action, "action_failed", tostring(methodResult), modules, beforeSnapshot, returnSnapshot, "Verify targets are visible in Dex Explorer.")
+            end
+            changed = true
+            message = "Explorer selection updated."
+            data.mode = mode
+            data.targetCount = #objects
+            data.targets = {}
+            for i = 1,#objects do
+                data.targets[#data.targets + 1] = SummarizeInstance(objects[i])
+            end
+        elseif action == "explorer.select.clear" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "ClearSelection", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, resultOrErr = pcall(method)
+            if not okCall then
+                return BuildDexActionError(action, "action_failed", tostring(resultOrErr), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = resultOrErr == true
+            message = "Explorer selection cleared."
+        elseif action == "explorer.search.set" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "SearchSet", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local query = tostring(payload.query or payload.text or "")
+            local okCall, resultOrErr = pcall(method, query)
+            if not okCall or resultOrErr == false then
+                return BuildDexActionError(action, "action_failed", okCall and tostring(resultOrErr) or tostring(resultOrErr), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer search updated."
+            data.query = query
+        elseif action == "explorer.search.clear" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "SearchClear", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, resultOrErr = pcall(method)
+            if not okCall or resultOrErr == false then
+                return BuildDexActionError(action, "action_failed", okCall and tostring(resultOrErr) or tostring(resultOrErr), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer search cleared."
+        elseif action == "explorer.expand.all" or action == "explorer.collapse.all" then
+            local methodName = action == "explorer.expand.all" and "ExpandAll" or "CollapseAll"
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, methodName, "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, methodErrMsg = pcall(method)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(methodErrMsg or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = action == "explorer.expand.all" and "Explorer expanded all selected nodes." or "Explorer collapsed all selected nodes."
+        elseif action == "explorer.jump_to_parent" or action == "explorer.select_children" then
+            local methodName = action == "explorer.jump_to_parent" and "JumpToParent" or "SelectChildren"
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, methodName, "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, resultOrErr = pcall(method)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(resultOrErr or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = action == "explorer.jump_to_parent" and "Explorer selection moved to parent." or "Explorer selected child nodes."
+            data.count = tonumber(resultOrErr) or nil
+        elseif action == "explorer.rename" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "Rename", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local name = tostring(payload.name or "")
+            if name == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.name is required.", modules, beforeSnapshot, returnSnapshot, "Provide payload.name for explorer.rename.")
+            end
+            local okCall, okResult, errOrName = pcall(method, name)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(errOrName), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer rename succeeded."
+            data.name = errOrName or name
+        elseif action == "explorer.cut" or action == "explorer.copy" or action == "explorer.duplicate" or action == "explorer.delete"
+            or action == "explorer.group" or action == "explorer.ungroup" then
+            local methodMap = {
+                ["explorer.cut"] = "Cut",
+                ["explorer.copy"] = "Copy",
+                ["explorer.duplicate"] = "Duplicate",
+                ["explorer.delete"] = "Delete",
+                ["explorer.group"] = "Group",
+                ["explorer.ungroup"] = "Ungroup",
+            }
+            local methodName = methodMap[action]
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, methodName, "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, info = pcall(method)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(info or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer action completed: " .. action
+            if typeof(info) == "Instance" then
+                data.result = SummarizeInstance(info)
+            else
+                data.result = info
+            end
+        elseif action == "explorer.paste_into" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "PasteInto", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local targets, resolveErr = ResolveObjectsFromActionRequest(req, modules, {allowEmpty = true, fallbackToSelection = false})
+            if not targets then
+                return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "Provide target instancePath(s) or select destination in Dex.")
+            end
+            local okCall, okResult, pastedCount = pcall(method, targets)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(pastedCount or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer paste completed."
+            data.pastedCount = tonumber(pastedCount) or 0
+        elseif action == "explorer.reparent" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "Reparent", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local newParentPath = tostring(payload.newParentPath or payload.parentPath or "")
+            if newParentPath == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.newParentPath is required.", modules, beforeSnapshot, returnSnapshot, "Provide payload.newParentPath.")
+            end
+            local newParent, parentErr = ResolveInstancePath(newParentPath)
+            if not newParent then
+                return BuildDexActionError(action, "target_not_found", parentErr, modules, beforeSnapshot, returnSnapshot, "Use a valid parent instancePath.")
+            end
+
+            local targets, resolveErr = ResolveObjectsFromActionRequest(req, modules, {allowEmpty = true, fallbackToSelection = true})
+            if not targets then
+                return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            if #targets > 0 and typeof(explorerMCP.SelectObjects) == "function" then
+                pcall(explorerMCP.SelectObjects, targets, "replace")
+            end
+
+            local okCall, okResult, movedCount = pcall(method, newParent)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(movedCount or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer reparent completed."
+            data.newParent = SummarizeInstance(newParent)
+            data.movedCount = tonumber(movedCount) or 0
+        elseif action == "explorer.insert_object" then
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, "InsertObject", "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local className = tostring(payload.className or "")
+            if className == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.className is required.", modules, beforeSnapshot, returnSnapshot, "Provide payload.className.")
+            end
+            local parentObj = nil
+            if typeof(payload.parentPath) == "string" and payload.parentPath ~= "" then
+                local pObj, pErr = ResolveInstancePath(payload.parentPath)
+                if not pObj then
+                    return BuildDexActionError(action, "target_not_found", pErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                parentObj = pObj
+            elseif typeof(req.instancePath) == "string" and req.instancePath ~= "" then
+                local pObj, pErr = ResolveInstancePath(req.instancePath)
+                if not pObj then
+                    return BuildDexActionError(action, "target_not_found", pErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                parentObj = pObj
+            end
+            local okCall, okResult, objOrErr = pcall(method, className, parentObj)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(objOrErr), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer inserted object."
+            data.inserted = SummarizeInstance(objOrErr)
+        elseif action == "explorer.copy_path" or action == "explorer.call_function" or action == "explorer.get_lua_references"
+            or action == "explorer.save_instance" or action == "explorer.view_connections" or action == "explorer.view_api"
+            or action == "explorer.view_object" or action == "explorer.view_script" or action == "explorer.select_character"
+            or action == "explorer.refresh_nil" or action == "explorer.hide_nil.toggle" or action == "explorer.teleport_to" then
+            local methodMap = {
+                ["explorer.copy_path"] = "CopyPath",
+                ["explorer.call_function"] = "CallFunction",
+                ["explorer.get_lua_references"] = "GetLuaReferences",
+                ["explorer.save_instance"] = "SaveInstance",
+                ["explorer.view_connections"] = "ViewConnections",
+                ["explorer.view_api"] = "ViewAPI",
+                ["explorer.view_object"] = "ViewObject",
+                ["explorer.view_script"] = "ViewScript",
+                ["explorer.select_character"] = "SelectCharacter",
+                ["explorer.refresh_nil"] = "RefreshNil",
+                ["explorer.hide_nil.toggle"] = "HideNil",
+                ["explorer.teleport_to"] = "TeleportTo",
+            }
+            local methodName = methodMap[action]
+            local method, methodErr = EnsureBridgeMethod(explorerMCP, methodName, "Explorer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+
+            local arg1 = nil
+            if action == "explorer.call_function" then
+                arg1 = typeof(payload.args) == "table" and payload.args or {}
+            elseif action == "explorer.save_instance" then
+                arg1 = payload.filePath
+            end
+
+            local okCall, okResult, info = pcall(method, arg1)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(info or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Explorer action completed: " .. action
+            if typeof(info) == "Instance" then
+                data.result = SummarizeInstance(info)
+            else
+                data.result = info
+            end
+        else
+            return BuildDexActionError(action, "invalid_action", "Unsupported explorer action.", modules, beforeSnapshot, returnSnapshot, "")
+        end
+    elseif string.sub(action, 1, 11) == "properties." then
+        local propertiesMCP = modules.propertiesMCP
+        if typeof(propertiesMCP) ~= "table" then
+            return BuildDexActionError(action, "bridge_not_ready", "Dex Properties bridge is unavailable.", modules, beforeSnapshot, returnSnapshot, "Call ensure-dex first.")
+        end
+
+        if action == "properties.search.set" or action == "properties.search.clear" then
+            local methodName = action == "properties.search.set" and "SearchSet" or "SearchClear"
+            local method, methodErr = EnsureBridgeMethod(propertiesMCP, methodName, "Properties")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local query = tostring(payload.query or payload.text or "")
+            local okCall, okResult = pcall(method, query)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = action == "properties.search.set" and "Properties search updated." or "Properties search cleared."
+            data.query = query
+        elseif action == "properties.expand_category" or action == "properties.expand_property" then
+            local methodName = action == "properties.expand_category" and "ExpandCategory" or "ExpandProperty"
+            local method, methodErr = EnsureBridgeMethod(propertiesMCP, methodName, "Properties")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local keyName = action == "properties.expand_category" and tostring(payload.categoryName or "") or tostring(payload.fullName or "")
+            if keyName == "" then
+                local missingName = action == "properties.expand_category" and "payload.categoryName" or "payload.fullName"
+                return BuildDexActionError(action, "invalid_payload", missingName .. " is required.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local setExpanded = payload.expanded
+            local okCall, okResult, errOrValue = pcall(method, keyName, setExpanded)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(errOrValue or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Properties expansion updated."
+            data.key = keyName
+            data.expanded = setExpanded
+        elseif action == "properties.attributes.toggle_visibility" then
+            local method, methodErr = EnsureBridgeMethod(propertiesMCP, "ToggleAttributesVisibility", "Properties")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, visibleOrErr = pcall(method, payload.visible)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(visibleOrErr or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Properties attribute visibility updated."
+            data.visible = visibleOrErr
+        elseif action == "properties.sound_preview.play" or action == "properties.sound_preview.pause" or action == "properties.sound_preview.stop" then
+            local method, methodErr = EnsureBridgeMethod(propertiesMCP, "SoundPreview", "Properties")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local mode = action == "properties.sound_preview.play" and "play" or (action == "properties.sound_preview.pause" and "pause" or "stop")
+            local soundObj = nil
+            if mode == "play" then
+                local resolved, resolveErr = ResolveDexTargetInstance(payload.instancePath or req.instancePath, req.selectionIndex)
+                if not resolved then
+                    return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "Provide instancePath to a Sound object.")
+                end
+                soundObj = resolved
+            end
+            local okCall, okResult, info = pcall(method, mode, soundObj)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(info or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Properties sound preview updated."
+            if typeof(soundObj) == "Instance" then
+                data.sound = SummarizeInstance(soundObj)
+            end
+        else
+            local target, resolveErr = ResolveDexTargetInstance(req.instancePath, req.selectionIndex)
+            if not target then
+                return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "Provide instancePath or select a Dex item first.")
+            end
+
+            if action == "properties.select_target" then
+                if typeof(modules.explorerMCP) == "table" and typeof(modules.explorerMCP.SelectObjects) == "function" then
+                    pcall(modules.explorerMCP.SelectObjects, {target}, "replace")
+                end
+                changed = true
+                message = "Properties target selected."
+                data.target = SummarizeInstance(target)
+            elseif action == "properties.set" or action == "properties.clear_value" then
+                local method, methodErr = EnsureBridgeMethod(propertiesMCP, "SetProperty", "Properties")
+                if not method then
+                    return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local propName = tostring(payload.name or "")
+                if propName == "" then
+                    return BuildDexActionError(action, "invalid_payload", "payload.name is required.", modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local patchPayload = payload
+                if action == "properties.clear_value" then
+                    patchPayload = {clear = true}
+                end
+                local okCall, okResult, errOrNil = pcall(method, target, propName, patchPayload)
+                if not okCall or okResult == false then
+                    return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+                end
+                changed = true
+                message = "Property updated."
+                data.target = SummarizeInstance(target)
+                data.name = propName
+            elseif action == "properties.set_batch" then
+                local method, methodErr = EnsureBridgeMethod(propertiesMCP, "SetPropertiesBatch", "Properties")
+                if not method then
+                    return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local patches = payload.patches
+                if typeof(patches) ~= "table" then
+                    return BuildDexActionError(action, "invalid_payload", "payload.patches must be an array.", modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local okCall, applied, errors = pcall(method, target, patches)
+                if not okCall then
+                    return BuildDexActionError(action, "action_failed", tostring(applied), modules, beforeSnapshot, returnSnapshot, "")
+                end
+                changed = (tonumber(applied) or 0) > 0
+                message = "Batch property update finished."
+                data.target = SummarizeInstance(target)
+                data.applied = tonumber(applied) or 0
+                data.errors = errors or {}
+            elseif action == "properties.attributes.add" or action == "properties.attributes.edit" then
+                local method, methodErr = EnsureBridgeMethod(propertiesMCP, "AttributeUpsert", "Properties")
+                if not method then
+                    return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local name = tostring(payload.name or "")
+                if name == "" then
+                    return BuildDexActionError(action, "invalid_payload", "payload.name is required.", modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local okCall, okResult, errOrNil = pcall(method, target, name, payload.value)
+                if not okCall or okResult == false then
+                    return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+                end
+                changed = true
+                message = "Attribute upsert completed."
+                data.target = SummarizeInstance(target)
+                data.name = name
+            elseif action == "properties.attributes.remove" then
+                local method, methodErr = EnsureBridgeMethod(propertiesMCP, "AttributeRemove", "Properties")
+                if not method then
+                    return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local name = tostring(payload.name or "")
+                if name == "" then
+                    return BuildDexActionError(action, "invalid_payload", "payload.name is required.", modules, beforeSnapshot, returnSnapshot, "")
+                end
+                local okCall, okResult, errOrNil = pcall(method, target, name)
+                if not okCall or okResult == false then
+                    return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+                end
+                changed = true
+                message = "Attribute removed."
+                data.target = SummarizeInstance(target)
+                data.name = name
+            else
+                return BuildDexActionError(action, "invalid_action", "Unsupported properties action.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+        end
+    elseif string.sub(action, 1, 14) == "script_viewer." then
+        local scriptViewerMCP = modules.scriptViewerMCP
+        if typeof(scriptViewerMCP) ~= "table" then
+            return BuildDexActionError(action, "bridge_not_ready", "Dex Script Viewer bridge is unavailable.", modules, beforeSnapshot, returnSnapshot, "Call ensure-dex first.")
+        end
+
+        if action == "script_viewer.open" then
+            local target, resolveErr = ResolveDexTargetInstance(req.instancePath, req.selectionIndex)
+            if not target then
+                return BuildDexActionError(action, "target_not_found", resolveErr, modules, beforeSnapshot, returnSnapshot, "Provide instancePath to a script instance.")
+            end
+            if not target:IsA("LuaSourceContainer") then
+                return BuildDexActionError(action, "invalid_payload", "Target is not a script instance.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local method, methodErr = EnsureBridgeMethod(scriptViewerMCP, "OpenScript", "ScriptViewer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, errOrNil = pcall(method, target)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Script Viewer opened target script."
+            data.target = SummarizeInstance(target)
+        elseif action == "script_viewer.get_text" then
+            local method, methodErr = EnsureBridgeMethod(scriptViewerMCP, "GetCurrentText", "ScriptViewer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, textOrErr = pcall(method)
+            if not okCall then
+                return BuildDexActionError(action, "action_failed", tostring(textOrErr), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = false
+            message = "Script Viewer text retrieved."
+            data.source = tostring(textOrErr or "")
+            data.length = #data.source
+        elseif action == "script_viewer.copy_text" then
+            local method, methodErr = EnsureBridgeMethod(scriptViewerMCP, "CopyCurrentText", "ScriptViewer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, info = pcall(method)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(info or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Script Viewer text copied to clipboard."
+            data.copiedChars = tonumber(info) or nil
+        elseif action == "script_viewer.save_to_file" then
+            local method, methodErr = EnsureBridgeMethod(scriptViewerMCP, "SaveCurrentText", "ScriptViewer")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, savedPath = pcall(method, payload.filePath)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(savedPath or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Script Viewer text saved to file."
+            data.filePath = tostring(savedPath)
+        else
+            return BuildDexActionError(action, "invalid_action", "Unsupported script_viewer action.", modules, beforeSnapshot, returnSnapshot, "")
+        end
+    elseif string.sub(action, 1, 5) == "main." then
+        local mainMCP = modules.mainMCP
+        if typeof(mainMCP) ~= "table" then
+            return BuildDexActionError(action, "bridge_not_ready", "Dex main bridge is unavailable.", modules, beforeSnapshot, returnSnapshot, "Call ensure-dex first.")
+        end
+
+        if action == "main.menu.set_open" then
+            local open = payload.open == true
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "SetMenuOpen", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, menuOpenOrErr = pcall(method, open)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(menuOpenOrErr or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Dex main menu state updated."
+            data.requestedOpen = open
+            data.menuOpen = menuOpenOrErr
+        elseif action == "main.app.set_open" then
+            local appName = tostring(payload.appName or payload.app or "")
+            local open = payload.open == true
+            if appName == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.appName is required.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "SetAppOpen", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, resolvedOrErr = pcall(method, appName, open)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(resolvedOrErr or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Dex app state updated."
+            data.appName = tostring(resolvedOrErr or appName)
+            data.open = open
+        elseif action == "main.window.focus" then
+            local appName = tostring(payload.appName or payload.app or "")
+            if appName == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.appName is required.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "FocusWindow", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, resolvedOrErr = pcall(method, appName)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(resolvedOrErr or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Dex window focused."
+            data.appName = tostring(resolvedOrErr or appName)
+        elseif action == "main.settings.get" then
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "GetSettings", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, value, errOrNil = pcall(method, payload.path)
+            if not okCall or (value == nil and errOrNil ~= nil) then
+                return BuildDexActionError(action, "action_failed", tostring(errOrNil or value), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = false
+            message = "Dex settings retrieved."
+            data.path = payload.path or ""
+            data.value = value
+        elseif action == "main.settings.set" then
+            local path = tostring(payload.path or "")
+            if path == "" then
+                return BuildDexActionError(action, "invalid_payload", "payload.path is required.", modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "SetSetting", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, errOrNil = pcall(method, path, payload.value)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Dex setting updated."
+            data.path = path
+            data.value = payload.value
+        elseif action == "main.settings.reset" then
+            local method, methodErr = EnsureBridgeMethod(mainMCP, "ResetSettings", "Main")
+            if not method then
+                return BuildDexActionError(action, "action_failed", methodErr, modules, beforeSnapshot, returnSnapshot, "")
+            end
+            local okCall, okResult, errOrNil = pcall(method)
+            if not okCall or okResult == false then
+                return BuildDexActionError(action, "action_failed", tostring(errOrNil or okResult), modules, beforeSnapshot, returnSnapshot, "")
+            end
+            changed = true
+            message = "Dex settings reset."
+        else
+            return BuildDexActionError(action, "invalid_action", "Unsupported main action.", modules, beforeSnapshot, returnSnapshot, "")
+        end
+    else
+        return BuildDexActionError(action, "invalid_action", "Unsupported action namespace.", modules, beforeSnapshot, returnSnapshot, "")
+    end
+
+    local afterSnapshot = returnSnapshot and CaptureDexSnapshot() or nil
+    if changed == false and returnSnapshot then
+        changed = DidSnapshotChange(beforeSnapshot, afterSnapshot)
+    end
+    return BuildDexActionResult(action, changed, message, modules, data, beforeSnapshot, afterSnapshot, nil)
+end
+
+local function ExecuteDexBatch(actions, stopOnError)
+    if typeof(actions) ~= "table" then
+        return {
+            status = "error",
+            successCount = 0,
+            failureCount = 1,
+            stopOnError = stopOnError ~= false,
+            results = {{
+                status = "error",
+                action = "",
+                changed = false,
+                errorCode = "invalid_payload",
+                message = "actions must be an array."
+            }}
+        }
+    end
+
+    local shouldStopOnError = stopOnError ~= false
+    local results = {}
+    local successCount = 0
+    local failureCount = 0
+
+    for i = 1,#actions do
+        local step = actions[i]
+        if typeof(step) ~= "table" then
+            local err = {
+                status = "error",
+                action = "",
+                changed = false,
+                errorCode = "invalid_payload",
+                message = "actions[" .. tostring(i) .. "] must be an object.",
+            }
+            results[#results + 1] = err
+            failureCount = failureCount + 1
+            if shouldStopOnError then
+                break
+            end
+        else
+            local actionReq = {
+                action = step.action,
+                instancePath = step.instancePath,
+                instancePaths = step.instancePaths,
+                selectionIndex = step.selectionIndex,
+                selectionIndices = step.selectionIndices,
+                payload = step.payload,
+                options = step.options,
+            }
+            local result = ExecuteDexAction(actionReq)
+            result.stepIndex = i
+            results[#results + 1] = result
+            if result.status == "ok" then
+                successCount = successCount + 1
+            else
+                failureCount = failureCount + 1
+                if shouldStopOnError then
+                    break
+                end
+            end
+        end
+    end
+
+    return {
+        status = failureCount == 0 and "ok" or "error",
+        successCount = successCount,
+        failureCount = failureCount,
+        stopOnError = shouldStopOnError,
+        results = results,
+    }
+end
+
+local function GetDexCapabilities()
+    local modules = GetDexBridgeModules()
+    local descriptors = {}
+    for i = 1,#DEX_ACTIONS do
+        local action = DEX_ACTIONS[i]
+        descriptors[#descriptors + 1] = {
+            action = action,
+            requiresBridgeReady = IsDexWriteAction(action),
+            requiredPayloadKeys = DEX_ACTION_PAYLOAD_KEYS[action] or {},
+        }
+    end
+
+    return {
+        status = "ok",
+        bridgeReady = modules.bridgeReady,
+        bridgeStatus = modules.bridgeStatus,
+        bridgeVersion = modules.bridge and modules.bridge.version or nil,
+        bridgeMessage = modules.bridgeMessage,
+        actions = DEX_ACTIONS,
+        descriptors = descriptors,
+    }
 end
 
 --// Main Loop \\--
@@ -1956,6 +4097,20 @@ while true do
             message = message or "Script source returned.",
             source = sourceText
         }
+    end)
+
+    Bridge:BindToType("dex-list-capabilities", function(data)
+        return GetDexCapabilities()
+    end)
+
+    Bridge:BindToType("dex-action", function(data)
+        return ExecuteDexAction(data)
+    end)
+
+    Bridge:BindToType("dex-batch-actions", function(data)
+        local actions = data.actions
+        local stopOnError = data.stopOnError
+        return ExecuteDexBatch(actions, stopOnError)
     end)
 
     Bridge:BindToType("ensure-remote-spy", function(data)
