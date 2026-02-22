@@ -881,17 +881,6 @@ const NO_CLIENT_ERROR = {
       text: "No Roblox client connected to the MCP server. Please notify the user that they have to run the connector.luau script in order to connect the MCP server to their game.",
     },
   ],
-  isError: true,
-};
-
-const INVALID_CLIENT_ERROR = {
-  content: [
-    {
-      type: "text" as const,
-      text: "Invalid client ID provided. Please use the get-clients tool to get a list of valid client IDs.",
-    },
-  ],
-  isError: true,
 };
 
 // ─── Client registry helpers ────────────────────────────────────────────────────
@@ -991,6 +980,14 @@ function resolveTargetClient(clientId?: string): RobloxClient | null {
 }
 
 // ─── Abstraction layer — these work in both primary & secondary mode ────────────
+
+function hasConnectedClients(): boolean {
+  if (instanceRole === "secondary") {
+    return relaySocket !== null && relaySocket.readyState === WebSocket.OPEN;
+  }
+  return getActiveClients().length > 0;
+}
+
 function SendToClient(target: RobloxClient, message: string) {
   if (target.transport === "ws" && target.ws && target.ws.readyState === WebSocket.OPEN) {
     target.ws.send(message);
@@ -1051,31 +1048,14 @@ function SendArbitraryDataToClient(
     return id;
   }
 
-  if (clientId !== undefined) {
-    const target = resolveTargetClient(clientId);
-    if (!target) return "INVALID_CLIENT";
-
-    if (id === undefined) id = crypto.randomUUID();
-
-    const message = { id, ...data, type };
-    requestToClientId.set(id, target.clientId);
-    SendToClient(target, JSON.stringify(message));
-
-    return id;
-  }
-
-  // If clientId is undefined, replicate to all active clients
-  const activeClients = getActiveClients();
-  if (activeClients.length === 0) return null;
+  const target = resolveTargetClient(clientId);
+  if (!target) return null;
 
   if (id === undefined) id = crypto.randomUUID();
-  const message = { id, ...data, type };
 
-  for (const target of activeClients) {
-    // We only track the last one for routing, but the primary broadcasts to all
-    requestToClientId.set(id, target.clientId);
-    SendToClient(target, JSON.stringify(message));
-  }
+  const message = { id, ...data, type };
+  requestToClientId.set(id, target.clientId);
+  SendToClient(target, JSON.stringify(message));
 
   return id;
 }
@@ -1546,8 +1526,6 @@ server.registerTool(
 
     if (result === null) {
       return NO_CLIENT_ERROR;
-    } else if (result === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     return {
@@ -1604,8 +1582,6 @@ server.registerTool(
 
     if (result === null) {
       return NO_CLIENT_ERROR;
-    } else if (result === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     return {
@@ -1670,8 +1646,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -1731,8 +1705,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -1795,8 +1767,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -1878,8 +1848,6 @@ COMBINING SELECTORS: Chain selectors for AND logic. Example: Part.Tagged[Anchore
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -1956,8 +1924,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2006,8 +1972,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2078,8 +2042,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2132,8 +2094,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2216,8 +2176,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2270,8 +2228,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2323,8 +2279,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2376,8 +2330,6 @@ server.registerTool(
 
     if (toolCallId === null) {
       return NO_CLIENT_ERROR;
-    } else if (toolCallId === "INVALID_CLIENT") {
-      return INVALID_CLIENT_ERROR;
     }
 
     const response = (await GetResponseOfIdFromClient(toolCallId)) as
@@ -2388,6 +2340,594 @@ server.registerTool(
       return {
         content: [
           { type: "text", text: "Failed to ignore/unignore remote. Response: " + JSON.stringify(response) },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "ensure-dex",
+  {
+    title: "Ensure Dex explorer is loaded",
+    description:
+      "Loads Dex explorer from the pinned source if it is not already running. Returns loaded/already_loaded/loading_timeout plus Dex bridge state (ready/fallback/patch_failed).",
+    inputSchema: z.object({
+      waitTimeoutMs: z
+        .number()
+        .int()
+        .min(1000)
+        .max(30000)
+        .describe(
+          "Maximum time in milliseconds to wait for Dex MainMenu to appear after injection (default: 12000, range: 1000-30000)."
+        )
+        .optional()
+        .default(12000),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ waitTimeoutMs, clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "ensure-dex",
+      { waitTimeoutMs },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to ensure Dex explorer. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-status",
+  {
+    title: "Get Dex explorer status",
+    description:
+      "Checks whether Dex explorer is currently loaded and reports menu state, location, and Dex bridge state/version.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-status",
+      {},
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to get Dex status. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-overview",
+  {
+    title: "Get Dex overview",
+    description:
+      "Returns Dex loaded/menu status, window visibility hints, search text, selection count, and bridge state summary.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-overview",
+      {},
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to get Dex overview. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-selection",
+  {
+    title: "Get Dex explorer selection",
+    description:
+      "Returns the current Dex selection as paginated rows (path/class/debugId/childCount/depth) plus bridge state.",
+    inputSchema: z.object({
+      startIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe("1-based selection page start index (default: 1)")
+        .optional()
+        .default(1),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .describe(
+          "Maximum selection rows to return (default: 200, max: 1000)"
+        )
+        .optional()
+        .default(200),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ startIndex, limit, clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-selection",
+      { startIndex, limit },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to get Dex selection. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-explorer-tree",
+  {
+    title: "Get Dex explorer tree snapshot",
+    description:
+      "Returns a paginated Explorer tree snapshot (depth/expanded/hasChildren/path/class) using Dex bridge when available with fallback hierarchy mode.",
+    inputSchema: z.object({
+      startIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe("1-based tree page start index (default: 1)")
+        .optional()
+        .default(1),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .describe(
+          "Maximum tree rows to return (default: 500, max: 1000)"
+        )
+        .optional()
+        .default(500),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ startIndex, limit, clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-explorer-tree",
+      { startIndex, limit },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to get Dex explorer tree. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "search-dex-explorer",
+  {
+    title: "Search Dex explorer tree",
+    description:
+      "Searches Dex explorer snapshot by name/class/path and returns paginated results. Can include ancestor chain and preserves UI state by default.",
+    inputSchema: z.object({
+      query: z.string().describe("Search query string (name/class/path match)."),
+      startIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe("1-based search result page start index (default: 1)")
+        .optional()
+        .default(1),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .describe(
+          "Maximum search rows to return (default: 500, max: 1000)"
+        )
+        .optional()
+        .default(500),
+      includeAncestors: z
+        .boolean()
+        .describe(
+          "Whether to include ancestors of matched rows in the result set (default: false)."
+        )
+        .optional()
+        .default(false),
+      preserveUi: z
+        .boolean()
+        .describe(
+          "Whether to preserve Dex UI state while searching (default: true)."
+        )
+        .optional()
+        .default(true),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({
+    query,
+    startIndex,
+    limit,
+    includeAncestors,
+    preserveUi,
+    clientId,
+  }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "search-dex-explorer",
+      { query, startIndex, limit, includeAncestors, preserveUi },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to search Dex explorer. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-properties",
+  {
+    title: "Get Dex-style properties snapshot",
+    description:
+      "Returns a Dex-style property list for a target instance (instancePath first, else Dex selection). Uses bridge reader with fallback mode.",
+    inputSchema: z.object({
+      instancePath: z
+        .string()
+        .describe(
+          "Optional target instance path expression (for example: game.Workspace.Part). If omitted, uses Dex selection."
+        )
+        .optional(),
+      selectionIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe(
+          "When instancePath is omitted, choose which Dex selection entry to use (1-based, default: 1)."
+        )
+        .optional()
+        .default(1),
+      search: z
+        .string()
+        .describe("Optional text filter over property name/category/type.")
+        .optional(),
+      startIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe("1-based property page start index (default: 1)")
+        .optional()
+        .default(1),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .describe(
+          "Maximum property rows to return (default: 300, max: 1000)"
+        )
+        .optional()
+        .default(300),
+      includeTags: z
+        .boolean()
+        .describe("Whether to include property tags metadata (default: true).")
+        .optional()
+        .default(true),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({
+    instancePath,
+    selectionIndex,
+    search,
+    startIndex,
+    limit,
+    includeTags,
+    clientId,
+  }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-properties",
+      {
+        instancePath: instancePath || "",
+        selectionIndex,
+        search: search || "",
+        startIndex,
+        limit,
+        includeTags,
+      },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to get Dex properties. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-dex-script-viewer",
+  {
+    title: "Read script source via Dex Script Viewer",
+    description:
+      "Returns script source from Dex Script Viewer buffer when possible, otherwise uses decompile/fallback cache. Supports target resolution by instancePath or Dex selection.",
+    inputSchema: z.object({
+      instancePath: z
+        .string()
+        .describe(
+          "Optional target script path expression (for example: game.ReplicatedStorage.SomeModule). If omitted, uses Dex selection or current viewer buffer."
+        )
+        .optional(),
+      selectionIndex: z
+        .number()
+        .int()
+        .min(1)
+        .describe(
+          "When instancePath is omitted and Dex selection is used, choose selection entry (1-based, default: 1)."
+        )
+        .optional()
+        .default(1),
+      preferCurrentViewer: z
+        .boolean()
+        .describe(
+          "Prefer current Script Viewer buffer when available (default: true)."
+        )
+        .optional()
+        .default(true),
+      maxChars: z
+        .number()
+        .int()
+        .min(1000)
+        .max(500000)
+        .describe("Maximum number of characters to return (default: 200000).")
+        .optional()
+        .default(200000),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({
+    instancePath,
+    selectionIndex,
+    preferCurrentViewer,
+    maxChars,
+    clientId,
+  }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "get-dex-script-viewer",
+      {
+        instancePath: instancePath || "",
+        selectionIndex,
+        preferCurrentViewer,
+        maxChars,
+      },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to read Dex Script Viewer data. Response: " +
+              JSON.stringify(response),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: response.output }],
+    };
+  }
+);
+
+server.registerTool(
+  "set-dex-menu-open",
+  {
+    title: "Set Dex main menu open state",
+    description:
+      "Opens or closes Dex MainMenu without unloading Dex. Call ensure-dex first if Dex is not loaded.",
+    inputSchema: z.object({
+      open: z
+        .boolean()
+        .describe("true to open Dex main menu, false to close it"),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ open, clientId }) => {
+    const toolCallId = SendArbitraryDataToClient(
+      "set-dex-menu-open",
+      { open },
+      undefined,
+      clientId
+    );
+
+    if (toolCallId === null) {
+      return NO_CLIENT_ERROR;
+    }
+
+    const response = (await GetResponseOfIdFromClient(toolCallId)) as
+      | { output: string }
+      | undefined;
+
+    if (response === undefined || response.output === undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Failed to set Dex menu state. Response: " +
+              JSON.stringify(response),
+          },
         ],
       };
     }

@@ -5,57 +5,14 @@ end
 
 --// Variables \\--
 local BridgeURL = getgenv().BridgeURL or ... or "localhost:16384"
-
---// Libraries \\--
--- Lua 5.1+ base64 v3.0 (c) 2009 by Alex Kloss <alexthkloss@web.de>
--- licensed under the terms of the LGPL2
-
--- character table string
-local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
--- encoding
-function base64_encode(data)
-    return ((data:gsub('.', function(x) 
-        local r,b='',x:byte()
-        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
-        return r;
-    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
-        if (#x < 6) then return '' end
-        local c=0
-        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
-        return b:sub(c+1,c+1)
-    end)..({ '', '==', '=' })[#data%3+1])
-end
+local DEX_SCRIPT_URL = "https://github.com/LorekeeperZinnia/Dex/releases/download/1.0.0/out.lua"
+local DEX_BRIDGE_KEY = "__ROBLOX_EXECUTOR_MCP_DEX_BRIDGE"
+local DEX_BRIDGE_VERSION = "dex-bridge-1"
 
 --// Functions \\--
 local LuaEncode = loadstring(game:HttpGet("https://raw.githubusercontent.com/chadhyatt/LuaEncode/refs/heads/master/src/LuaEncode.lua"))()
 local cloneref = cloneref or function(x) return x end
-local decompile = decompile or function(scriptPath: Script | ModuleScript | LocalScript): string
-    local okBytecode: boolean, bytecode: string = pcall(getscriptbytecode, scriptPath)
-
-    if not okBytecode then
-        return `-- Failed to get script bytecode, error:\n\n--[[\n{bytecode}\n--]]`
-    end
-
-    local okRequest: boolean, httpResult = pcall(request, {
-        Url = "https://medal.upio.dev/decompile",
-        Method = "POST",
-        Body = base64_encode(bytecode),
-        Headers = {
-            ["Content-Type"] = "text/plain"
-        },
-    })
-
-    if not okRequest then
-        return `-- Failed to decompile, error:\n\n--[[\n{httpResult}\n--]]`
-    end
-
-    if httpResult.StatusCode ~= 200 then
-        return `-- Error occurred while requesting the API, error:\n\n--[[\n{httpResult.Body}\n--]]`
-    end
-
-    return string.gsub(httpResult.Body, string.char(0x00CD), " ")
-end
+local decompile = decompile or function(x) return "-- Unable to get script content." end
 local getnilinstances = getnilinstances or function() return {} end
 local getscriptbytecode = getscriptbytecode or function(x) error("Unable to get script bytecode.") end
 
@@ -565,6 +522,799 @@ local function ParseQuery(query)
     return stringMatchQueries
 end
 
+--// Dex Helpers \\--
+local function FindDexMainMenu()
+    local mainMenu = CoreGui:FindFirstChild("MainMenu")
+    if mainMenu and mainMenu:IsA("ScreenGui") then
+        return mainMenu, "CoreGui"
+    end
+
+    local localPlayer = Players.LocalPlayer
+    local playerGui = localPlayer and localPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        mainMenu = playerGui:FindFirstChild("MainMenu")
+        if mainMenu and mainMenu:IsA("ScreenGui") then
+            return mainMenu, "PlayerGui"
+        end
+    end
+
+    return nil, nil
+end
+
+local function GetDexMenuOpenState(mainMenu)
+    if not mainMenu or not mainMenu:IsA("ScreenGui") then
+        return nil, nil, nil
+    end
+
+    local openButton = mainMenu:FindFirstChild("OpenButton", true)
+    if not openButton or not openButton:IsA("TextButton") then
+        return nil, nil, nil
+    end
+
+    local buttonText = tostring(openButton.Text or "")
+    if buttonText == "X" then
+        return true, buttonText, openButton
+    end
+    if buttonText == "Dex" then
+        return false, buttonText, openButton
+    end
+
+    return nil, buttonText, openButton
+end
+
+local function TryToggleDexMenu(openButton, requestedOpen)
+    if not openButton or not openButton:IsA("GuiButton") then
+        return false, "none"
+    end
+
+    local function IsRequestedState()
+        local text = tostring(openButton.Text or "")
+        if requestedOpen then
+            return text == "X"
+        end
+        return text == "Dex"
+    end
+
+    if IsRequestedState() then
+        return true, "none"
+    end
+
+    local activateCalled = pcall(function()
+        openButton:Activate()
+    end)
+
+    if activateCalled then
+        local waitStart = os.clock()
+        while os.clock() - waitStart < 1 do
+            if IsRequestedState() then
+                return true, "activate"
+            end
+            task.wait()
+        end
+    end
+
+    if getconnections then
+        local gotConnections, connections = pcall(getconnections, openButton.MouseButton1Click)
+        if gotConnections and typeof(connections) == "table" then
+            for _, connection in connections do
+                pcall(function()
+                    if connection and connection.Fire then
+                        connection:Fire()
+                    end
+                end)
+            end
+
+            local waitStart = os.clock()
+            while os.clock() - waitStart < 1 do
+                if IsRequestedState() then
+                    return true, "getconnections"
+                end
+                task.wait()
+            end
+        end
+    end
+
+    return IsRequestedState(), activateCalled and "activate" or "none"
+end
+
+local DexSourceCache = nil
+local DexBridgeRuntimeState = {
+    status = "fallback",
+    message = "Dex bridge has not been initialized yet. Call ensure-dex first."
+}
+
+local function GetBridgeEnv()
+    if getgenv then
+        return getgenv()
+    end
+    return _G
+end
+
+local function SetDexBridgeRuntimeState(status, message)
+    DexBridgeRuntimeState.status = status
+    DexBridgeRuntimeState.message = message
+end
+
+local function GetDexBridge()
+    local bridge = GetBridgeEnv()[DEX_BRIDGE_KEY]
+    if typeof(bridge) == "table" then
+        return bridge
+    end
+    return nil
+end
+
+local function GetDexBridgeStatus()
+    local bridge = GetDexBridge()
+    if bridge then
+        local bridgeStatus = bridge.status
+        if bridgeStatus ~= "ready" and bridgeStatus ~= "fallback" and bridgeStatus ~= "patch_failed" then
+            bridgeStatus = bridge.ready and "ready" or "fallback"
+        end
+        return bridge, bridgeStatus, tostring(bridge.message or "Dex bridge state available.")
+    end
+
+    return nil, DexBridgeRuntimeState.status, DexBridgeRuntimeState.message
+end
+
+local function ClampInt(value, minValue, maxValue, fallback)
+    local n = tonumber(value)
+    if n == nil then
+        n = fallback
+    end
+    n = math.floor(n)
+    if n < minValue then n = minValue end
+    if n > maxValue then n = maxValue end
+    return n
+end
+
+local function Paginate(list, startIndex, limit, maxLimit, defaultLimit)
+    local pageStart = ClampInt(startIndex, 1, math.max(1, #list), 1)
+    local pageLimit = ClampInt(limit, 1, maxLimit, defaultLimit)
+    local pageEnd = math.min(#list, pageStart + pageLimit - 1)
+    local results = {}
+
+    for i = pageStart, pageEnd do
+        results[#results + 1] = list[i]
+    end
+
+    return {
+        total = #list,
+        startIndex = pageStart,
+        limit = pageLimit,
+        returned = #results,
+        hasMore = pageEnd < #list,
+        results = results
+    }
+end
+
+local function ContainsCaseInsensitive(haystack, needle)
+    if needle == "" then
+        return true
+    end
+    return string.find(string.lower(tostring(haystack or "")), string.lower(needle), 1, true) ~= nil
+end
+
+local function BuildSimpleInstancePath(obj)
+    if typeof(obj) ~= "Instance" then
+        return "<non-instance>"
+    end
+
+    if obj == game then
+        return "game"
+    end
+
+    local pathParts = {}
+    local current = obj
+
+    while current and current ~= game do
+        local currentName = current.Name
+        if string.match(currentName, "^[%a_][%w_]*$") then
+            table.insert(pathParts, 1, "." .. currentName)
+        else
+            table.insert(pathParts, 1, "[" .. string.format("%q", currentName) .. "]")
+        end
+        current = current.Parent
+    end
+
+    if current ~= game then
+        return tostring(obj)
+    end
+
+    return "game" .. table.concat(pathParts)
+end
+
+local function SafePathFromInstance(obj)
+    if typeof(obj) ~= "Instance" then
+        return "<non-instance>"
+    end
+
+    local bridge = GetDexBridge()
+    local explorer = bridge and bridge.apps and bridge.apps.Explorer
+    if typeof(explorer) == "table" and typeof(explorer.GetInstancePath) == "function" then
+        local ok, path = pcall(explorer.GetInstancePath, obj)
+        if ok and typeof(path) == "string" and path ~= "" then
+            return path
+        end
+    end
+
+    return BuildSimpleInstancePath(obj)
+end
+
+local function ResolveInstancePath(instancePath)
+    if typeof(instancePath) ~= "string" or instancePath == "" then
+        return nil, "instancePath is empty."
+    end
+
+    local ok, resolved = pcall(function()
+        return loadstring("return " .. instancePath)()
+    end)
+    if not ok then
+        return nil, "Failed to resolve instancePath: " .. tostring(resolved)
+    end
+
+    if typeof(resolved) ~= "Instance" then
+        return nil, "instancePath did not resolve to an Instance."
+    end
+
+    return resolved, nil
+end
+
+local function ResolveDexTargetInstance(instancePath, selectionIndex)
+    if typeof(instancePath) == "string" and instancePath ~= "" then
+        return ResolveInstancePath(instancePath)
+    end
+
+    local bridge, bridgeStatus = GetDexBridgeStatus()
+    if bridgeStatus ~= "ready" or not bridge then
+        return nil, "Dex bridge is not ready. Call ensure-dex first or provide instancePath."
+    end
+
+    local explorer = bridge.apps and bridge.apps.Explorer
+    local mcp = explorer and explorer.__MCP
+    if typeof(mcp) ~= "table" or typeof(mcp.GetSelectionNodes) ~= "function" then
+        return nil, "Dex selection reader is unavailable. Provide instancePath."
+    end
+
+    local okSelection, selectionNodes = pcall(mcp.GetSelectionNodes)
+    if not okSelection or typeof(selectionNodes) ~= "table" then
+        return nil, "Failed to read Dex selection. Provide instancePath."
+    end
+
+    if #selectionNodes == 0 then
+        return nil, "Dex selection is empty. Select an instance in Dex or provide instancePath."
+    end
+
+    local resolvedIndex = ClampInt(selectionIndex, 1, #selectionNodes, 1)
+    local selectedNode = selectionNodes[resolvedIndex]
+    if typeof(selectedNode) ~= "table" or typeof(selectedNode.Obj) ~= "Instance" then
+        return nil, "Dex selection entry is invalid. Provide instancePath."
+    end
+
+    return selectedNode.Obj, nil
+end
+
+local function ReplaceOnce(source, pattern, replacement)
+    local count = 0
+    local updated = string.gsub(source, pattern, function()
+        count = count + 1
+        return replacement
+    end, 1)
+    return updated, count
+end
+
+local function PatchDexSource(rawSource)
+    if typeof(rawSource) ~= "string" or rawSource == "" then
+        return nil, "Dex source is empty."
+    end
+
+    if string.find(rawSource, DEX_BRIDGE_KEY, 1, true) then
+        return rawSource, nil
+    end
+
+    local explorerBridgeSnippet = [[
+	Explorer.__MCP = Explorer.__MCP or {}
+	Explorer.__MCP.Version = "dex-bridge-1"
+
+	Explorer.__MCP.GetSelectionNodes = function()
+		local result = {}
+		if not selection or not selection.List then
+			return result
+		end
+		for i = 1,#selection.List do
+			result[#result+1] = selection.List[i]
+		end
+		return result
+	end
+
+	Explorer.__MCP.GetSelectionCount = function()
+		return (selection and selection.List and #selection.List) or 0
+	end
+
+	Explorer.__MCP.GetSearchText = function()
+		local searchBar = Explorer.GuiElems and Explorer.GuiElems.SearchBar
+		if searchBar and searchBar.Text then
+			return tostring(searchBar.Text)
+		end
+		return ""
+	end
+
+	Explorer.__MCP.GetTreeRows = function(options)
+		options = options or {}
+		local includeAll = options.includeAll == true
+		local includeSearchOnly = options.includeSearchOnly == true
+		local includeNilRoot = options.includeNilRoot ~= false
+		local rows = {}
+
+		local function walk(root, depth)
+			if not root then return end
+			for i = 1,#root do
+				local node = root[i]
+				if node and not node.Del then
+					local isExpanded = expanded and expanded[node] and true or false
+					local isSearchResult = searchResults and searchResults[node] and true or false
+					if (not includeSearchOnly) or isSearchResult then
+						rows[#rows+1] = {
+							Node = node,
+							Depth = depth,
+							Expanded = isExpanded,
+							HasChildren = #node > 0,
+							IsSearchResult = isSearchResult,
+							IsNilRoot = false
+						}
+					end
+					if #node > 0 and (includeAll or isExpanded) then
+						walk(node, depth + 1)
+					end
+				end
+			end
+		end
+
+		walk(nodes and nodes[game], 0)
+
+		if includeNilRoot and nilNode and nodes and nodes[nilNode.Obj] then
+			local isExpanded = expanded and expanded[nilNode] and true or false
+			local isSearchResult = searchResults and searchResults[nilNode] and true or false
+			if (not includeSearchOnly) or isSearchResult then
+				rows[#rows+1] = {
+					Node = nilNode,
+					Depth = 0,
+					Expanded = isExpanded,
+					HasChildren = #nilNode > 0,
+					IsSearchResult = isSearchResult,
+					IsNilRoot = true
+				}
+			end
+			if #nilNode > 0 and (includeAll or isExpanded) then
+				walk(nilNode, 1)
+			end
+		end
+
+		return rows
+	end
+
+	Explorer.__MCP.GetNodeForObject = function(obj)
+		if not nodes then return nil end
+		return nodes[obj]
+	end
+]]
+
+    local propertiesBridgeSnippet = [[
+	Properties.__MCP = Properties.__MCP or {}
+	Properties.__MCP.Version = "dex-bridge-1"
+
+	Properties.__MCP.BuildRowsForObject = function(obj, options)
+		options = options or {}
+		if typeof(obj) ~= "Instance" then
+			return {}, "Target object is not an Instance."
+		end
+		if not Explorer or not Explorer.Selection then
+			return {}, "Explorer selection is unavailable."
+		end
+
+		local includeTags = options.includeTags ~= false
+		local search = tostring(options.search or "")
+		local searchLower = string.lower(search)
+
+		local selectionRef = Explorer.Selection
+		local oldList = selectionRef.List
+		local oldMap = selectionRef.Map
+		local tempNode = {Obj = obj, Class = obj.ClassName}
+
+		selectionRef.List = {tempNode}
+		selectionRef.Map = {[tempNode] = true}
+
+		local ok, err = pcall(function()
+			Properties.ShowExplorerProps()
+		end)
+
+		local rows = {}
+		if ok then
+			for i = 1,#viewList do
+				local prop = viewList[i]
+				if prop and not prop.CategoryName and not prop.SpecialRow then
+					local displayName = prop.DisplayName or prop.Name or ""
+					local valueOk, valueOrErr = pcall(function()
+						return Properties.GetPropVal(prop, obj)
+					end)
+
+					local row = {
+						Category = prop.Category or "Data",
+						Name = prop.Name or displayName,
+						DisplayName = displayName,
+						Class = prop.Class or obj.ClassName,
+						ValueType = prop.ValueType and prop.ValueType.Name or "unknown",
+						Value = valueOk and valueOrErr or nil,
+						Readable = valueOk,
+						ReadableValue = valueOk and tostring(valueOrErr) or "<unreadable>",
+						SubName = prop.SubName
+					}
+					if includeTags then
+						row.Tags = prop.Tags or {}
+					end
+
+					if search == ""
+						or string.find(string.lower(tostring(row.Name or "")), searchLower, 1, true)
+						or string.find(string.lower(tostring(row.DisplayName or "")), searchLower, 1, true)
+						or string.find(string.lower(tostring(row.Category or "")), searchLower, 1, true) then
+						rows[#rows+1] = row
+					end
+				end
+			end
+		end
+
+		selectionRef.List = oldList
+		selectionRef.Map = oldMap
+		pcall(function()
+			Properties.ShowExplorerProps()
+		end)
+
+		if not ok then
+			return {}, "Failed to build properties snapshot: " .. tostring(err)
+		end
+
+		return rows, nil
+	end
+]]
+
+    local scriptViewerBridgeSnippet = [[
+	local __mcpOriginalViewScript = ScriptViewer.ViewScript
+	ScriptViewer.__MCP = ScriptViewer.__MCP or {}
+	ScriptViewer.__MCP.Version = "dex-bridge-1"
+	ScriptViewer.__MCP.LastScript = nil
+	ScriptViewer.__MCP.LastSource = nil
+
+	ScriptViewer.ViewScript = function(scr)
+		ScriptViewer.__MCP.LastScript = scr
+		__mcpOriginalViewScript(scr)
+		if codeFrame then
+			local okText, textValue = pcall(function()
+				return codeFrame:GetText()
+			end)
+			if okText and typeof(textValue) == "string" then
+				ScriptViewer.__MCP.LastSource = textValue
+			end
+		end
+	end
+
+	ScriptViewer.__MCP.GetCurrentText = function()
+		if codeFrame then
+			local okText, textValue = pcall(function()
+				return codeFrame:GetText()
+			end)
+			if okText and typeof(textValue) == "string" then
+				return textValue
+			end
+		end
+		return ScriptViewer.__MCP.LastSource
+	end
+
+	ScriptViewer.__MCP.GetCurrentScript = function()
+		return ScriptViewer.__MCP.LastScript
+	end
+]]
+
+    local patchedSource = rawSource
+
+    local explorerCount
+    patchedSource, explorerCount = ReplaceOnce(
+        patchedSource,
+        "return Explorer%s*end%s*%-%- TODO: Remove when open source",
+        explorerBridgeSnippet .. "\n\treturn Explorer\nend\n\n-- TODO: Remove when open source"
+    )
+    if explorerCount == 0 then
+        return nil, "Failed to patch Explorer module return block."
+    end
+
+    local propertiesCount
+    patchedSource, propertiesCount = ReplaceOnce(
+        patchedSource,
+        "return Properties%s*end%s*%-%- TODO: Remove when open source",
+        propertiesBridgeSnippet .. "\n\treturn Properties\nend\n\n-- TODO: Remove when open source"
+    )
+    if propertiesCount == 0 then
+        return nil, "Failed to patch Properties module return block."
+    end
+
+    local scriptViewerCount
+    patchedSource, scriptViewerCount = ReplaceOnce(
+        patchedSource,
+        "return ScriptViewer%s*end%s*%-%- TODO: Remove when open source",
+        scriptViewerBridgeSnippet .. "\n\treturn ScriptViewer\nend\n\n-- TODO: Remove when open source"
+    )
+    if scriptViewerCount == 0 then
+        return nil, "Failed to patch ScriptViewer module return block."
+    end
+
+    local bridgeFooter = string.format([[
+do
+	local __bridgeEnv = (getgenv and getgenv()) or _G
+	local __bridge = __bridgeEnv[%q] or {}
+	__bridgeEnv[%q] = __bridge
+
+	__bridge.version = %q
+	__bridge.main = Main
+	__bridge.apps = Main and Main.Apps or nil
+	__bridge.api = API
+	__bridge.rmd = RMD
+
+	local __apps = __bridge.apps
+	local __explorer = __apps and __apps.Explorer
+	local __properties = __apps and __apps.Properties
+	local __scriptViewer = __apps and __apps.ScriptViewer
+
+	local __ready = typeof(__explorer) == "table"
+		and typeof(__properties) == "table"
+		and typeof(__scriptViewer) == "table"
+		and typeof(__explorer.__MCP) == "table"
+		and typeof(__properties.__MCP) == "table"
+		and typeof(__scriptViewer.__MCP) == "table"
+
+	__bridge.ready = __ready
+	__bridge.status = __ready and "ready" or "fallback"
+	__bridge.message = __ready and "Dex bridge initialized." or "Dex loaded, but bridge hooks were only partially initialized."
+end
+]], DEX_BRIDGE_KEY, DEX_BRIDGE_KEY, DEX_BRIDGE_VERSION)
+
+    return patchedSource .. "\n\n" .. bridgeFooter, nil
+end
+
+local function FetchDexSource()
+    if DexSourceCache then
+        return DexSourceCache
+    end
+
+    local source = game:HttpGet(DEX_SCRIPT_URL)
+    assert(typeof(source) == "string" and #source > 0, "Dex source download returned an empty payload.")
+    DexSourceCache = source
+    return source
+end
+
+local function RunDexInjectedSource()
+    local okFetch, rawOrErr = pcall(FetchDexSource)
+    if not okFetch then
+        SetDexBridgeRuntimeState("patch_failed", "Failed to fetch Dex source: " .. tostring(rawOrErr))
+        return false, tostring(rawOrErr)
+    end
+
+    local patchedSource, patchErr = PatchDexSource(rawOrErr)
+    if not patchedSource then
+        SetDexBridgeRuntimeState("patch_failed", "Failed to patch Dex source: " .. tostring(patchErr))
+        return false, tostring(patchErr)
+    end
+
+    local chunk, compileErr = loadstring(patchedSource)
+    if not chunk then
+        SetDexBridgeRuntimeState("patch_failed", "Failed to compile patched Dex source: " .. tostring(compileErr))
+        return false, tostring(compileErr)
+    end
+
+    local bridgeEnv = GetBridgeEnv()
+    bridgeEnv[DEX_BRIDGE_KEY] = nil
+
+    local okRun, runErr = pcall(chunk)
+    if not okRun then
+        SetDexBridgeRuntimeState("patch_failed", "Failed to execute patched Dex source: " .. tostring(runErr))
+        return false, tostring(runErr)
+    end
+
+    local _, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+    if bridgeStatus == "ready" then
+        SetDexBridgeRuntimeState("ready", bridgeMessage)
+    else
+        SetDexBridgeRuntimeState("fallback", bridgeMessage)
+    end
+
+    return true, nil
+end
+
+local function BuildDexTreeRows(includeAll, includeSearchOnly)
+    local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+    local bridgeApps = bridge and bridge.apps
+    local explorer = bridgeApps and bridgeApps.Explorer
+    local mcp = explorer and explorer.__MCP
+
+    if bridgeStatus == "ready" and typeof(mcp) == "table" and typeof(mcp.GetTreeRows) == "function" then
+        local okRows, rowsOrErr = pcall(mcp.GetTreeRows, {
+            includeAll = includeAll == true,
+            includeSearchOnly = includeSearchOnly == true,
+            includeNilRoot = true
+        })
+        if okRows and typeof(rowsOrErr) == "table" then
+            local rows = {}
+            for i = 1,#rowsOrErr do
+                local rawRow = rowsOrErr[i]
+                if typeof(rawRow) ~= "table" then continue end
+                if typeof(rawRow.Node) ~= "table" then continue end
+                if typeof(rawRow.Node.Obj) ~= "Instance" then continue end
+
+                rows[#rows + 1] = {
+                    kind = "dex",
+                    Node = rawRow.Node,
+                    Object = rawRow.Node.Obj,
+                    Depth = tonumber(rawRow.Depth) or 0,
+                    Expanded = rawRow.Expanded == true,
+                    HasChildren = rawRow.HasChildren == true,
+                    IsSearchResult = rawRow.IsSearchResult == true,
+                    IsNilRoot = rawRow.IsNilRoot == true
+                }
+            end
+            return rows, "ready", bridgeMessage
+        end
+    end
+
+    local fallbackRows = {}
+    local function walk(instance, depth)
+        local children = instance:GetChildren()
+        fallbackRows[#fallbackRows + 1] = {
+            kind = "fallback",
+            Node = nil,
+            Object = instance,
+            Depth = depth,
+            Expanded = nil,
+            HasChildren = #children > 0,
+            IsSearchResult = nil,
+            IsNilRoot = false
+        }
+
+        for i = 1,#children do
+            walk(children[i], depth + 1)
+        end
+    end
+    walk(game, 0)
+
+    local fallbackStatus = (bridgeStatus == "patch_failed") and "patch_failed" or "fallback"
+    local fallbackMessage = "Dex bridge tree reader unavailable. Returned fallback hierarchy snapshot."
+    if bridgeMessage ~= nil and bridgeMessage ~= "" then
+        fallbackMessage = fallbackMessage .. " " .. bridgeMessage
+    end
+    return fallbackRows, fallbackStatus, fallbackMessage
+end
+
+local function ConvertTreeRowToOutput(rawRow)
+    local obj = rawRow.Object
+    local debugId = nil
+    local childCount = 0
+    local okDebug, debugValue = pcall(function()
+        return obj:GetDebugId()
+    end)
+    if okDebug then
+        debugId = debugValue
+    end
+    local okChildCount, childCountValue = pcall(function()
+        return #obj:GetChildren()
+    end)
+    if okChildCount then
+        childCount = childCountValue
+    end
+
+    return {
+        name = obj.Name,
+        className = obj.ClassName,
+        path = SafePathFromInstance(obj),
+        debugId = debugId,
+        depth = rawRow.Depth or 0,
+        expanded = rawRow.Expanded,
+        hasChildren = rawRow.HasChildren == true,
+        childCount = childCount,
+        isSearchResult = rawRow.IsSearchResult == true,
+        isNilRoot = rawRow.IsNilRoot == true
+    }
+end
+
+local function BuildFallbackPropertyRows(target, search, includeTags)
+    local rows = {}
+    local bridge = GetDexBridge()
+    local api = bridge and bridge.api
+    local found = {}
+
+    if typeof(api) == "table" and typeof(api.Classes) == "table" then
+        local classData = api.Classes[target.ClassName]
+        while classData do
+            local members = classData.Members
+            if typeof(members) == "table" then
+                for i = 1,#members do
+                    local member = members[i]
+                    if typeof(member) ~= "table" then continue end
+                    if member.MemberType ~= "Property" then continue end
+
+                    local propertyName = tostring(member.Name or "")
+                    if propertyName == "" or found[propertyName] then
+                        continue
+                    end
+                    found[propertyName] = true
+
+                    local valueOk, valueOrErr = pcall(function()
+                        return target[propertyName]
+                    end)
+
+                    local row = {
+                        category = tostring(member.Category or "Data"),
+                        name = propertyName,
+                        displayName = propertyName,
+                        type = (typeof(member.ValueType) == "table" and tostring(member.ValueType.Name or "unknown")) or tostring(member.ValueType or "unknown"),
+                        value = valueOk and valueOrErr or nil,
+                        readable = valueOk,
+                        readableValue = valueOk and tostring(valueOrErr) or "<unreadable>",
+                        source = "fallback_api"
+                    }
+                    if includeTags then
+                        row.tags = member.Tags or {}
+                    end
+
+                    if search == ""
+                        or ContainsCaseInsensitive(row.name, search)
+                        or ContainsCaseInsensitive(row.displayName, search)
+                        or ContainsCaseInsensitive(row.category, search)
+                        or ContainsCaseInsensitive(row.type, search) then
+                        rows[#rows + 1] = row
+                    end
+                end
+            end
+
+            classData = classData.Superclass
+        end
+    end
+
+    if #rows == 0 then
+        local attrs = {}
+        local okAttrs, attrsData = pcall(function()
+            return game.GetAttributes(target)
+        end)
+        if okAttrs and typeof(attrsData) == "table" then
+            attrs = attrsData
+        end
+
+        local commonRows = {
+            { category = "Data", name = "Name", type = "string", value = target.Name },
+            { category = "Data", name = "ClassName", type = "string", value = target.ClassName },
+            { category = "Data", name = "Parent", type = "Instance", value = target.Parent },
+            { category = "Data", name = "Archivable", type = "boolean", value = target.Archivable },
+            { category = "Attributes", name = "Attributes", type = "table", value = attrs },
+        }
+
+        for i = 1,#commonRows do
+            local row = commonRows[i]
+            row.displayName = row.name
+            row.readable = true
+            row.readableValue = tostring(row.value)
+            row.source = "fallback_common"
+            if includeTags then
+                row.tags = {}
+            end
+
+            if search == ""
+                or ContainsCaseInsensitive(row.name, search)
+                or ContainsCaseInsensitive(row.displayName, search)
+                or ContainsCaseInsensitive(row.category, search)
+                or ContainsCaseInsensitive(row.type, search) then
+                rows[#rows + 1] = row
+            end
+        end
+    end
+
+    return rows
+end
+
 --// Main Loop \\--
 while true do
     local Bridge = CreateBridge()
@@ -722,6 +1472,490 @@ while true do
         end
 
         return buildTree(rootInstance, 0)
+    end)
+
+    Bridge:BindToType("ensure-dex", function(data)
+        local waitTimeoutMs = ClampInt(data.waitTimeoutMs, 1000, 30000, 12000)
+        local initialMenu, initialLocation = FindDexMainMenu()
+        local wasAlreadyLoaded = initialMenu ~= nil
+
+        local mainMenu = initialMenu
+        local location = initialLocation
+
+        if not wasAlreadyLoaded then
+            local injectedOk, injectedErr = RunDexInjectedSource()
+            if not injectedOk then
+                error("Failed to load Dex explorer: " .. tostring(injectedErr))
+            end
+
+            local waitStart = os.clock()
+            while os.clock() - waitStart < (waitTimeoutMs / 1000) do
+                mainMenu, location = FindDexMainMenu()
+                if mainMenu then
+                    break
+                end
+                task.wait(0.1)
+            end
+        end
+
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local status = "loading_timeout"
+        local loaded = false
+        local message = "Dex script executed, but MainMenu was not detected before timeout."
+
+        if mainMenu then
+            loaded = true
+            status = wasAlreadyLoaded and "already_loaded" or "loaded"
+            if wasAlreadyLoaded then
+                message = "Dex explorer is already loaded."
+            else
+                message = "Dex explorer loaded successfully."
+            end
+        end
+
+        return {
+            status = status,
+            loaded = loaded,
+            location = location,
+            bridgeReady = bridgeReady,
+            bridgeStatus = bridgeStatus,
+            bridgeMessage = bridgeMessage,
+            message = message
+        }
+    end)
+
+    Bridge:BindToType("get-dex-status", function(data)
+        local mainMenu, location = FindDexMainMenu()
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local bridgeVersion = bridge and bridge.version or nil
+
+        if not mainMenu then
+            return {
+                status = "not_loaded",
+                loaded = false,
+                location = nil,
+                menuOpen = nil,
+                menuButtonText = nil,
+                bridgeReady = bridgeReady,
+                bridgeStatus = bridgeStatus,
+                bridgeVersion = bridgeVersion,
+                bridgeMessage = bridgeMessage,
+                message = "Dex explorer is not currently loaded."
+            }
+        end
+
+        local menuOpen, menuButtonText = GetDexMenuOpenState(mainMenu)
+        return {
+            status = "loaded",
+            loaded = true,
+            location = location,
+            menuOpen = menuOpen,
+            menuButtonText = menuButtonText,
+            bridgeReady = bridgeReady,
+            bridgeStatus = bridgeStatus,
+            bridgeVersion = bridgeVersion,
+            bridgeMessage = bridgeMessage,
+            message = "Dex explorer is loaded."
+        }
+    end)
+
+    Bridge:BindToType("set-dex-menu-open", function(data)
+        local requestedOpen = data.open == true
+        local mainMenu, location = FindDexMainMenu()
+        assert(mainMenu, "Dex explorer is not loaded. Call ensure-dex first.")
+
+        local initialOpen, _, openButton = GetDexMenuOpenState(mainMenu)
+        assert(openButton, "Dex menu button was not found. Dex UI may be in an unexpected state.")
+
+        if initialOpen == requestedOpen then
+            return {
+                status = "no_change",
+                requestedOpen = requestedOpen,
+                menuOpen = initialOpen,
+                changed = false,
+                method = "none",
+                location = location,
+                message = "Dex menu is already in the requested state."
+            }
+        end
+
+        local _, method = TryToggleDexMenu(openButton, requestedOpen)
+        local finalOpen = GetDexMenuOpenState(mainMenu)
+
+        if finalOpen ~= requestedOpen then
+            error("Failed to change Dex menu state. Executor may not support GUI activation fallback methods.")
+        end
+
+        local changed = if initialOpen == nil then true else finalOpen ~= initialOpen
+        return {
+            status = changed and "changed" or "no_change",
+            requestedOpen = requestedOpen,
+            menuOpen = finalOpen,
+            changed = changed,
+            method = method,
+            location = location,
+            message = "Dex menu state updated."
+        }
+    end)
+
+    Bridge:BindToType("get-dex-overview", function(data)
+        local mainMenu, location = FindDexMainMenu()
+        local menuOpen, menuButtonText = GetDexMenuOpenState(mainMenu)
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local explorer = bridge and bridge.apps and bridge.apps.Explorer
+        local properties = bridge and bridge.apps and bridge.apps.Properties
+        local scriptViewer = bridge and bridge.apps and bridge.apps.ScriptViewer
+        local explorerMCP = explorer and explorer.__MCP
+
+        local selectionCount = 0
+        if typeof(explorerMCP) == "table" and typeof(explorerMCP.GetSelectionCount) == "function" then
+            local okCount, count = pcall(explorerMCP.GetSelectionCount)
+            if okCount and tonumber(count) ~= nil then
+                selectionCount = tonumber(count)
+            end
+        end
+
+        local searchText = ""
+        if typeof(explorerMCP) == "table" and typeof(explorerMCP.GetSearchText) == "function" then
+            local okSearch, searchResult = pcall(explorerMCP.GetSearchText)
+            if okSearch and typeof(searchResult) == "string" then
+                searchText = searchResult
+            end
+        end
+
+        local function GetWindowVisible(windowObj)
+            if typeof(windowObj) ~= "table" or typeof(windowObj.IsVisible) ~= "function" then
+                return nil
+            end
+            local okVisible, visible = pcall(windowObj.IsVisible, windowObj)
+            if okVisible then
+                return visible == true
+            end
+            return nil
+        end
+
+        return {
+            status = mainMenu and "loaded" or "not_loaded",
+            loaded = mainMenu ~= nil,
+            location = location,
+            menuOpen = menuOpen,
+            menuButtonText = menuButtonText,
+            selectionCount = selectionCount,
+            searchText = searchText,
+            windows = {
+                explorerVisible = GetWindowVisible(explorer and explorer.Window),
+                propertiesVisible = GetWindowVisible(properties and properties.Window),
+                scriptViewerVisible = GetWindowVisible(scriptViewer and scriptViewer.Window),
+            },
+            bridgeReady = bridgeReady,
+            bridgeStatus = bridgeStatus,
+            bridgeVersion = bridge and bridge.version or nil,
+            bridgeMessage = bridgeMessage,
+            message = mainMenu and "Dex overview retrieved." or "Dex explorer is not loaded."
+        }
+    end)
+
+    Bridge:BindToType("get-dex-selection", function(data)
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local explorer = bridge and bridge.apps and bridge.apps.Explorer
+        local explorerMCP = explorer and explorer.__MCP
+
+        if not bridgeReady or typeof(explorerMCP) ~= "table" or typeof(explorerMCP.GetSelectionNodes) ~= "function" then
+            return {
+                status = "ok",
+                bridgeReady = false,
+                bridgeStatus = bridgeStatus,
+                bridgeMessage = bridgeMessage,
+                message = "Dex selection reader is unavailable. Call ensure-dex, then select an object in Dex.",
+                total = 0,
+                startIndex = 1,
+                limit = ClampInt(data.limit, 1, 1000, 200),
+                returned = 0,
+                hasMore = false,
+                results = {}
+            }
+        end
+
+        local okNodes, selectionNodes = pcall(explorerMCP.GetSelectionNodes)
+        if not okNodes or typeof(selectionNodes) ~= "table" then
+            error("Failed to read Dex selection nodes. Try calling ensure-dex again.")
+        end
+
+        local selectionEntries = {}
+        for i = 1,#selectionNodes do
+            local node = selectionNodes[i]
+            if typeof(node) ~= "table" or typeof(node.Obj) ~= "Instance" then
+                continue
+            end
+
+            local nodeDepth = 0
+            local parentNode = node.Parent
+            while parentNode do
+                nodeDepth += 1
+                parentNode = parentNode.Parent
+            end
+
+            local debugId = nil
+            local okDebug, debugValue = pcall(function()
+                return node.Obj:GetDebugId()
+            end)
+            if okDebug then
+                debugId = debugValue
+            end
+
+            local childCount = 0
+            local okChildren, childCountValue = pcall(function()
+                return #node.Obj:GetChildren()
+            end)
+            if okChildren then
+                childCount = childCountValue
+            end
+
+            selectionEntries[#selectionEntries + 1] = {
+                index = i,
+                name = node.Obj.Name,
+                className = node.Obj.ClassName,
+                path = SafePathFromInstance(node.Obj),
+                debugId = debugId,
+                childCount = childCount,
+                depth = nodeDepth
+            }
+        end
+
+        local page = Paginate(selectionEntries, data.startIndex, data.limit, 1000, 200)
+        page.status = "ok"
+        page.bridgeReady = true
+        page.bridgeStatus = bridgeStatus
+        page.bridgeMessage = bridgeMessage
+        page.message = (#selectionEntries == 0)
+            and "Dex selection is empty. Select an object in Dex or pass instancePath to other tools."
+            or "Dex selection snapshot retrieved."
+        return page
+    end)
+
+    Bridge:BindToType("get-dex-explorer-tree", function(data)
+        local rawRows, treeStatus, treeMessage = BuildDexTreeRows(false, false)
+        local outputRows = {}
+        for i = 1,#rawRows do
+            outputRows[#outputRows + 1] = ConvertTreeRowToOutput(rawRows[i])
+        end
+
+        local page = Paginate(outputRows, data.startIndex, data.limit, 1000, 500)
+        page.status = "ok"
+        page.bridgeReady = treeStatus == "ready"
+        page.bridgeStatus = treeStatus
+        page.message = treeMessage
+        return page
+    end)
+
+    Bridge:BindToType("search-dex-explorer", function(data)
+        local query = tostring(data.query or "")
+        local includeAncestors = data.includeAncestors == true
+        local preserveUi = data.preserveUi ~= false
+
+        local rawRows, treeStatus, treeMessage = BuildDexTreeRows(true, false)
+        local objectToIndex = {}
+        for i = 1,#rawRows do
+            objectToIndex[rawRows[i].Object] = i
+        end
+
+        local included = {}
+        for i = 1,#rawRows do
+            local outputRow = ConvertTreeRowToOutput(rawRows[i])
+            local isMatch = query == ""
+                or ContainsCaseInsensitive(outputRow.name, query)
+                or ContainsCaseInsensitive(outputRow.className, query)
+                or ContainsCaseInsensitive(outputRow.path, query)
+
+            if isMatch then
+                included[i] = true
+
+                if includeAncestors then
+                    local raw = rawRows[i]
+                    if raw.kind == "dex" and raw.Node then
+                        local parentNode = raw.Node.Parent
+                        while parentNode do
+                            local parentObj = parentNode.Obj
+                            if parentObj and objectToIndex[parentObj] then
+                                included[objectToIndex[parentObj]] = true
+                            end
+                            parentNode = parentNode.Parent
+                        end
+                    else
+                        local parentObj = raw.Object and raw.Object.Parent
+                        while parentObj do
+                            local parentIndex = objectToIndex[parentObj]
+                            if parentIndex then
+                                included[parentIndex] = true
+                            end
+                            if parentObj == game then
+                                break
+                            end
+                            parentObj = parentObj.Parent
+                        end
+                    end
+                end
+            end
+        end
+
+        local filtered = {}
+        for i = 1,#rawRows do
+            if included[i] then
+                filtered[#filtered + 1] = ConvertTreeRowToOutput(rawRows[i])
+            end
+        end
+
+        local page = Paginate(filtered, data.startIndex, data.limit, 1000, 500)
+        page.status = "ok"
+        page.query = query
+        page.includeAncestors = includeAncestors
+        page.preserveUi = preserveUi
+        page.bridgeReady = treeStatus == "ready"
+        page.bridgeStatus = treeStatus
+        page.message = "Dex explorer search completed without mutating Dex UI state. " .. treeMessage
+        return page
+    end)
+
+    Bridge:BindToType("get-dex-properties", function(data)
+        local searchText = tostring(data.search or "")
+        local includeTags = data.includeTags ~= false
+        local selectionIndex = ClampInt(data.selectionIndex, 1, 1000000, 1)
+        local target, resolveErr = ResolveDexTargetInstance(data.instancePath, selectionIndex)
+        assert(target, resolveErr)
+
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local properties = bridge and bridge.apps and bridge.apps.Properties
+        local propertiesMCP = properties and properties.__MCP
+
+        local rows = {}
+        local source = "fallback"
+        local message = "Dex properties snapshot returned using fallback reader."
+
+        if bridgeReady and typeof(propertiesMCP) == "table" and typeof(propertiesMCP.BuildRowsForObject) == "function" then
+            local okRows, dexRows, dexErr = pcall(propertiesMCP.BuildRowsForObject, target, {
+                search = searchText,
+                includeTags = includeTags
+            })
+            if okRows and typeof(dexRows) == "table" then
+                source = "dex_bridge"
+                message = "Dex properties snapshot retrieved from bridge."
+
+                for i = 1,#dexRows do
+                    local row = dexRows[i]
+                    if typeof(row) ~= "table" then continue end
+
+                    rows[#rows + 1] = {
+                        category = row.Category or row.category or "Data",
+                        name = row.Name or row.name or "",
+                        displayName = row.DisplayName or row.displayName or row.Name or row.name or "",
+                        type = row.ValueType or row.type or "unknown",
+                        value = row.Value,
+                        readable = row.Readable ~= false,
+                        readableValue = row.ReadableValue or tostring(row.Value),
+                        tags = includeTags and (row.Tags or row.tags or {}) or nil,
+                        source = source
+                    }
+                end
+            else
+                message = "Dex bridge properties reader failed; fallback reader used. " .. tostring(dexErr or "")
+                rows = BuildFallbackPropertyRows(target, searchText, includeTags)
+            end
+        else
+            rows = BuildFallbackPropertyRows(target, searchText, includeTags)
+        end
+
+        local page = Paginate(rows, data.startIndex, data.limit, 1000, 300)
+        page.status = "ok"
+        page.bridgeReady = bridgeReady
+        page.bridgeStatus = bridgeStatus
+        page.bridgeMessage = bridgeMessage
+        page.targetPath = SafePathFromInstance(target)
+        page.selectionIndex = selectionIndex
+        page.search = searchText
+        page.includeTags = includeTags
+        page.source = source
+        page.message = message
+        return page
+    end)
+
+    Bridge:BindToType("get-dex-script-viewer", function(data)
+        local preferCurrentViewer = data.preferCurrentViewer ~= false
+        local maxChars = ClampInt(data.maxChars, 1000, 500000, 200000)
+        local selectionIndex = ClampInt(data.selectionIndex, 1, 1000000, 1)
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        local bridgeReady = bridgeStatus == "ready" and bridge ~= nil
+        local scriptViewer = bridge and bridge.apps and bridge.apps.ScriptViewer
+        local scriptViewerMCP = scriptViewer and scriptViewer.__MCP
+
+        local sourceText = nil
+        local sourceFrom = nil
+        local message = nil
+        local target = nil
+
+        if preferCurrentViewer and (data.instancePath == nil or data.instancePath == "") and typeof(scriptViewerMCP) == "table" and typeof(scriptViewerMCP.GetCurrentText) == "function" then
+            local okViewer, viewerText = pcall(scriptViewerMCP.GetCurrentText)
+            if okViewer and typeof(viewerText) == "string" and viewerText ~= "" then
+                sourceText = viewerText
+                sourceFrom = "viewer_buffer"
+                message = "Returned source from currently opened Dex Script Viewer buffer."
+            end
+        end
+
+        if not sourceText then
+            local resolveTarget, resolveErr = ResolveDexTargetInstance(data.instancePath, selectionIndex)
+            assert(resolveTarget, resolveErr)
+            target = resolveTarget
+
+            assert(target:IsA("LuaSourceContainer"), "Target is not a script instance. Select a LocalScript/ModuleScript in Dex or provide instancePath.")
+            assert(not (target:IsA("Script") and target.RunContext == Enum.RunContext.Server), "Target is a server script. Provide a client-readable script.")
+
+            local okDecompile, decompileResult = pcall(decompile, target)
+            if okDecompile and typeof(decompileResult) == "string" and decompileResult ~= "" then
+                sourceText = decompileResult
+                sourceFrom = "decompile"
+                message = "Script source returned from decompile()."
+            else
+                local debugId = target:GetDebugId()
+                if not ScriptSourcesMap[debugId] then
+                    pcall(MapScriptSource, target)
+                end
+                local fallbackSource = ScriptSourcesMap[debugId]
+                if typeof(fallbackSource) == "string" and fallbackSource ~= "" then
+                    sourceText = fallbackSource
+                    sourceFrom = "fallback"
+                    message = "Script source returned from fallback script source cache."
+                else
+                    sourceText = "-- Unable to read script source via Dex viewer, decompile(), or fallback cache."
+                    sourceFrom = "fallback"
+                    message = "No script source reader succeeded."
+                end
+            end
+        end
+
+        local truncated = false
+        if #sourceText > maxChars then
+            sourceText = string.sub(sourceText, 1, maxChars)
+            truncated = true
+        end
+
+        return {
+            status = "ok",
+            bridgeReady = bridgeReady,
+            bridgeStatus = bridgeStatus,
+            bridgeMessage = bridgeMessage,
+            sourceFrom = sourceFrom or "fallback",
+            truncated = truncated,
+            maxChars = maxChars,
+            preferCurrentViewer = preferCurrentViewer,
+            targetPath = target and SafePathFromInstance(target) or nil,
+            message = message or "Script source returned.",
+            source = sourceText
+        }
     end)
 
     Bridge:BindToType("ensure-remote-spy", function(data)
