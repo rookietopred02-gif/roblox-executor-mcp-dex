@@ -42,8 +42,8 @@ pnpm install && pnpm run build
 **Codex** — Add to your JSON config:
 ```json
 [roblox-executor-mcp]
-"command": "npm"
-"args": ["/path/to/MCPServer/dist/index.js"]
+command = "npm"
+args = ["/path/to/MCPServer/dist/index.js"]
 
 ```
 
