@@ -39,6 +39,14 @@ pnpm install && pnpm run build
 }
 ```
 
+**Codex** — Add to your JSON config:
+```json
+[roblox-executor-mcp]
+"command": "npm"
+"args": ["/path/to/MCPServer/dist/index.js"]
+
+```
+
 **Codex** — Settings > MCP Settings > Add server: name `roblox-executor-mcp`, type `STDIO`, command `node`, args `/path/to/MCPServer/dist/index.js`.
 
 ### Connect from Roblox
