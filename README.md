@@ -5,12 +5,14 @@ An MCP server that bridges LLMs and a running Roblox Game Client — execute cod
 ## Features
 
 - **Code Execution & Data Querying** — Run Lua and fetch data from the game client.
+- **Tracked Executions** — Start, inspect, wait for, and cancel execution workflows.
 - **Script Inspection** — Decompile LocalScripts/ModuleScripts and search across sources.
 - **Instance Search** — CSS-like selectors via `QueryDescendants` and hierarchy trees.
 - **Remote Spy** — [Cobalt](https://github.com/notpoiu/cobalt) integration to intercept, log, block, and ignore Remotes/Bindables.
 - **Dex Explorer Full Control API** — [Dex](https://github.com/LorekeeperZinnia/Dex) Explorer/Properties/ScriptViewer/MainMenu read + write parity via action bus (`dex-bridge-2`).
 - **Multi-Client** — Connect multiple Roblox clients simultaneously; target each by `clientId`. Dashboard at `http://localhost:16384/`.
 - **Primary / Secondary** — Multiple MCP instances auto-coordinate; secondaries relay through the primary with automatic promotion.
+- **Health & Diagnostics** — Server health, bridge topology, request metrics, connector health, Dex health, remote spy status, and script index readiness.
 
 ## Prerequisites
 
@@ -62,21 +64,47 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/notpoiu/roblox-execut
 
 | Category | Tool | Description |
 |---|---|---|
-| **Execution** | `execute` | Run Lua code (actions) |
-| | `get-data-by-code` | Run Lua code and return results |
+| **Health / Targeting** | `get-health` | Overall bridge health and active clients |
+| | `get-bridge-topology` | Primary/secondary, relay, and transport summary |
+| | `get-request-metrics` | Request, timeout, failure, and queue metrics |
+| | `list-clients` | List connected clients |
+| | `get-default-client` | Get the current default client |
+| | `set-default-client` | Set the default client |
+| | `clear-default-client` | Clear the default client override |
+| | `wait-for-client` | Wait for a client to appear |
+| | `get-client-context` | Get detailed place/job/transport context for one client |
+| | `get-targeting-policy` | Explain how implicit targeting currently works |
+| | `list-pending-commands` | Inspect pending HTTP queue items and tracked executions |
+| | `doctor` | Aggregate diagnostics across bridge and connector |
+| **Execution** | `run-code` | Unified execution API with optional return values |
+| | `start-execution` | Start a tracked execution |
+| | `get-execution` | Inspect a tracked execution |
+| | `wait-for-execution` | Wait for a tracked execution to finish |
+| | `cancel-execution` | Cancel a queued execution when possible |
+| | `execute` | Legacy action-style execution tool |
+| | `execute-file` | Legacy file-backed execution tool |
+| | `get-data-by-code` | Legacy return-value execution tool |
 | **Scripts** | `get-script-content` | Decompile a script's source |
 | | `search-scripts-sources` | Search all scripts by source content |
-| **Introspection** | `list-clients` | List connected clients |
-| | `get-console-output` | Retrieve console logs |
+| | `get-script-index-status` | Report script source mapping progress |
+| **Introspection** | `get-console-output` | Retrieve console logs |
 | | `search-instances` | CSS-like instance search |
 | | `get-descendants-tree` | Instance hierarchy tree |
 | | `get-game-info` | Game metadata |
+| | `get-connector-health` | Connector-side health, transport, Dex, and script index status |
 | **Remote Spy** | `ensure-remote-spy` | Load Cobalt (required first) |
+| | `get-remote-spy-status` | Loaded state plus blocked/ignored policy status |
+| | `get-remote-spy-summary` | Compact status + activity summary |
 | | `get-remote-spy-logs` | Get captured remote call logs |
 | | `clear-remote-spy-logs` | Clear all logs |
 | | `block-remote` | Block/unblock a remote |
 | | `ignore-remote` | Ignore/unignore a remote |
+| | `remote-spy-block` | Alias for block-remote |
+| | `remote-spy-ignore` | Alias for ignore-remote |
 | **Dex Explorer (Read)** | `ensure-dex` | Load Dex from pinned release URL (prerequisite) |
+| | `get-dex-bridge-health` | Dex bridge readiness and patch status |
+| | `wait-for-dex-ready` | Poll until Dex bridge is ready |
+| | `get-dex-snapshot` | Aggregate Dex health + overview |
 | | `get-dex-status` | Dex loaded state, location, menu state, bridge state/version |
 | | `get-dex-overview` | Load/menu/window/search/selection summary + bridge state |
 | | `get-dex-selection` | Paginated current Dex selection snapshot |
@@ -104,6 +132,12 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/notpoiu/roblox-execut
 | | `dex-settings-reset` | Reset Dex settings to defaults |
 
 Dex target resolution priority: `instancePath` first, then Dex `selectionIndex` (default `1`).
+
+### Targeting Policy
+
+- If only one client is active, tools may still omit `clientId`.
+- If multiple clients are active, mutating tools now require an explicit `clientId`.
+- You can set a default client for convenience, but explicit `clientId` is still recommended for high-risk operations.
 
 If bridge patching fails, read tools continue in fallback mode (`bridgeStatus=fallback|patch_failed`) with reduced fidelity.
 Write/mutate actions require `bridgeStatus=ready` and return explicit `bridge_not_ready` when unavailable.

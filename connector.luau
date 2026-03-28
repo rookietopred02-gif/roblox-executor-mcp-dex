@@ -31,22 +31,65 @@ local WebSocketAvailable = (
     typeof(WebSocket.connect) == "function"
 ) and (getgenv().DisableWebSocket ~= true)
 
---// Registration Info \\--
-local function GetRegistrationInfo()
+local function GetContextInfo()
     local player = Players.LocalPlayer
     local placeName = "Unknown"
     pcall(function()
         local productInfo = MarketplaceService:GetProductInfo(game.PlaceId)
         placeName = productInfo.Name
     end)
+
     return {
-        type = "register",
         username = player and player.Name or "Unknown",
         userId = player and player.UserId or 0,
         placeId = game.PlaceId,
         jobId = game.JobId,
         placeName = placeName,
     }
+end
+
+--// Registration Info \\--
+local function GetRegistrationInfo()
+    local info = GetContextInfo()
+    local payload = {
+        type = "register",
+        username = info.username,
+        userId = info.userId,
+        placeId = info.placeId,
+        jobId = info.jobId,
+        placeName = info.placeName,
+    }
+    return payload
+end
+
+local function BuildContextSignature()
+    local info = GetContextInfo()
+    return tostring(info.placeId) .. "|" .. tostring(info.jobId) .. "|" .. tostring(info.placeName)
+end
+
+local function PostJsonWithRetry(url, body, maxAttempts)
+    maxAttempts = maxAttempts or 3
+    local lastResponse = nil
+
+    for _ = 1, maxAttempts do
+        local ok, response = pcall(request, {
+            Url = url,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(body)
+        })
+
+        if ok and response and response.StatusCode == 200 then
+            return true, response
+        end
+
+        lastResponse = response
+        task.wait(0.2)
+    end
+
+    return false, lastResponse
 end
 
 --// Base Bridge Class \\--
@@ -93,6 +136,34 @@ local BaseBridge = {}; do
             success = true,
             id = id
         }
+    end
+
+    function BaseBridge:ReportContextIfNeeded()
+        if not self.ClientId then
+            return
+        end
+
+        local signature = BuildContextSignature()
+        if self.LastContextSignature == signature then
+            return
+        end
+
+        local payload = GetContextInfo()
+        payload.clientId = self.ClientId
+        local ok = false
+        pcall(function()
+            local response = request({
+                Url = "http://" .. BridgeURL .. "/context",
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode(payload),
+            })
+            ok = response and response.StatusCode == 200
+        end)
+
+        if ok then
+            self.LastContextSignature = signature
+        end
     end
     
     function BaseBridge:IsAlive()
@@ -150,24 +221,10 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
         self.Connected = true
         self.Callbacks = {}
         self.ClientId = nil
+        self.LastContextSignature = nil
 
         --// Send registration \\--
         self.WebSocket:Send(HttpService:JSONEncode(GetRegistrationInfo()))
-
-        self.AliveThread = task.spawn(function()
-            while task.wait(1) do
-                if self:IsAlive() or not self.Connected then
-                    continue
-                end
-                
-                self.Connected = false
-                break
-            end
-    
-            pcall(function()
-                self.WebSocket:Close()
-            end)
-        end)
     
         --// On Message \\--
         self.WebSocket.OnMessage:Connect(function(message)
@@ -176,12 +233,21 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
             --// Handle registration response \\--
             if data.type == "registered" then
                 self.ClientId = data.clientId
+                self.LastContextSignature = nil
+                self:ReportContextIfNeeded()
                 return
             end
 
             local response = self:HandleMessage(data)
             if response then
                 self.WebSocket:Send(HttpService:JSONEncode(response))
+            end
+        end)
+
+        self.ContextThread = task.spawn(function()
+            while self.Connected do
+                self:ReportContextIfNeeded()
+                task.wait(2)
             end
         end)
     
@@ -216,6 +282,7 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
         self.Callbacks = {}
         self.PollInterval = 0.1
         self.ClientId = nil
+        self.LastContextSignature = nil
 
         --// Register with the server \\--
         pcall(function()
@@ -228,6 +295,8 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
             if regResponse.StatusCode == 200 and regResponse.Body then
                 local regData = HttpService:JSONDecode(regResponse.Body)
                 self.ClientId = regData.clientId
+                self.LastContextSignature = nil
+                self:ReportContextIfNeeded()
             end
         end)
     
@@ -257,6 +326,7 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
                     end
                     
                     consecutiveFailures = 0
+                    self:ReportContextIfNeeded()
     
                     --// Handle response \\--
                     if response.Body and response.Body ~= "" then
@@ -267,14 +337,7 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
                         if result == nil then return end
                         
                         --// Send response back \\--
-                        request({
-                            Url = "http://" .. BridgeURL .. "/respond",
-                            Method = "POST",
-                            Headers = {
-                                ["Content-Type"] = "application/json"
-                            },
-                            Body = HttpService:JSONEncode(result)
-                        })
+                        PostJsonWithRetry("http://" .. BridgeURL .. "/respond", result, 3)
                     end
                 end)
     
@@ -3463,6 +3526,9 @@ while true do
     Bridge:BindToType("execute", function(data)
         loadstring(data.source)()
         setthreadidentity(8)
+        return {
+            status = "completed"
+        }
     end)
 
     Bridge:BindToType("get-console-output", function(data)
@@ -4321,6 +4387,115 @@ while true do
         end
 
         error("Remote not found: " .. remoteName .. " in " .. direction .. " logs. Make sure the remote has been logged at least once.")
+    end)
+
+    Bridge:BindToType("get-script-index-status", function(data)
+        return {
+            status = "ok",
+            hasFinishedMapping = ScriptSourcesMap.HasFinishedMapping == true,
+            mappedSources = MappedSources,
+            sourcesToMap = SourcesToMap,
+            remaining = math.max(0, SourcesToMap - MappedSources),
+        }
+    end)
+
+    Bridge:BindToType("get-dex-bridge-health", function(data)
+        local mainMenu, location = FindDexMainMenu()
+        local menuOpen, menuButtonText = GetDexMenuOpenState(mainMenu)
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        return {
+            status = "ok",
+            loaded = mainMenu ~= nil,
+            location = location,
+            menuOpen = menuOpen,
+            menuButtonText = menuButtonText,
+            bridgeReady = bridgeStatus == "ready" and bridge ~= nil,
+            bridgeStatus = bridgeStatus,
+            bridgeVersion = bridge and bridge.version or nil,
+            bridgeMessage = bridgeMessage,
+        }
+    end)
+
+    Bridge:BindToType("get-remote-spy-status", function(data)
+        local Cobalt = getgenv().Cobalt
+        if not (Cobalt and Cobalt.shared and Cobalt.shared.Logs) then
+            return {
+                status = "not_loaded",
+                loaded = false,
+                outgoing = 0,
+                incoming = 0,
+                blocked = {},
+                ignored = {},
+            }
+        end
+
+        local function Summarize(logTable)
+            local total = 0
+            local blocked = {}
+            local ignored = {}
+
+            for instance, log in logTable do
+                if typeof(instance) ~= "Instance" then continue end
+                total += 1
+
+                local name = instance.Name
+                if log.Blocked then
+                    table.insert(blocked, name)
+                end
+                if log.Ignored then
+                    table.insert(ignored, name)
+                end
+            end
+
+            table.sort(blocked)
+            table.sort(ignored)
+
+            return total, blocked, ignored
+        end
+
+        local outgoingCount, outgoingBlocked, outgoingIgnored = Summarize(Cobalt.shared.Logs.Outgoing)
+        local incomingCount, incomingBlocked, incomingIgnored = Summarize(Cobalt.shared.Logs.Incoming)
+
+        return {
+            status = "ok",
+            loaded = true,
+            outgoing = outgoingCount,
+            incoming = incomingCount,
+            blocked = {
+                Outgoing = outgoingBlocked,
+                Incoming = incomingBlocked,
+            },
+            ignored = {
+                Outgoing = outgoingIgnored,
+                Incoming = incomingIgnored,
+            },
+        }
+    end)
+
+    Bridge:BindToType("get-connector-health", function(data)
+        local mainMenu, location = FindDexMainMenu()
+        local bridge, bridgeStatus, bridgeMessage = GetDexBridgeStatus()
+        return {
+            status = "ok",
+            clientId = Bridge.ClientId,
+            webSocketAvailable = WebSocketAvailable,
+            transport = Bridge.WebSocket and "ws" or "http",
+            bridgeUrl = BridgeURL,
+            context = GetContextInfo(),
+            dex = {
+                loaded = mainMenu ~= nil,
+                location = location,
+                bridgeReady = bridgeStatus == "ready" and bridge ~= nil,
+                bridgeStatus = bridgeStatus,
+                bridgeVersion = bridge and bridge.version or nil,
+                bridgeMessage = bridgeMessage,
+            },
+            scriptIndex = {
+                hasFinishedMapping = ScriptSourcesMap.HasFinishedMapping == true,
+                mappedSources = MappedSources,
+                sourcesToMap = SourcesToMap,
+            },
+        }
     end)
 
     Bridge:BindToType("search-scripts-sources", function(data)

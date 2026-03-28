@@ -13,6 +13,43 @@ const WS_PORT = 16384;
 const HTTP_POLL_TIMEOUT = 10000; // 10 seconds
 const PROMOTION_JITTER_MAX = 300; // ms
 const TOOL_RESPONSE_TIMEOUT = 15000; // 15 seconds
+const MUTATION_TIMEOUT_MS = 30000;
+
+type DispatchFailureCode =
+  | "NO_CLIENT"
+  | "MULTI_CLIENT_REQUIRES_TARGET"
+  | "CLIENT_NOT_FOUND"
+  | "RELAY_UNAVAILABLE";
+
+interface PendingHttpCommand {
+  requestId: string;
+  message: string;
+  enqueuedAt: number;
+  toolType: string;
+}
+
+interface RequestMetricSnapshot {
+  sent: number;
+  completed: number;
+  failed: number;
+  timedOut: number;
+  cancelled: number;
+}
+
+interface ExecutionRecord {
+  executionId: string;
+  requestId: string;
+  toolType: string;
+  clientId: string;
+  status: "queued" | "running" | "completed" | "failed" | "timed_out" | "cancelled";
+  createdAt: number;
+  updatedAt: number;
+  timeoutMs: number;
+  responseMode: "none" | "return";
+  payloadPreview: string;
+  output?: string;
+  error?: string;
+}
 
 // ─── Instance role ──────────────────────────────────────────────────────────────
 let instanceRole: "primary" | "secondary" = "primary";
@@ -28,7 +65,8 @@ interface RobloxClient {
   transport: "ws" | "http";
   ws?: WebSocket;
   lastHttpPoll: number;
-  pendingHttpCommand: any;
+  lastContextUpdate: number;
+  pendingHttpCommands: PendingHttpCommand[];
 }
 
 let clientRegistry: Map<string, RobloxClient> = new Map();
@@ -42,6 +80,17 @@ let wss: WebSocketServer | null = null;
 let httpResponseResolvers: Map<string, (data: any) => void> = new Map();
 // Track which clientId a given request id was sent to (for response routing)
 let requestToClientId: Map<string, string> = new Map();
+let requestToExecutionId: Map<string, string> = new Map();
+let executionRegistry: Map<string, ExecutionRecord> = new Map();
+let defaultClientId: string | null = null;
+let timedOutRequests: Set<string> = new Set();
+let requestMetrics: RequestMetricSnapshot = {
+  sent: 0,
+  completed: 0,
+  failed: 0,
+  timedOut: 0,
+  cancelled: 0,
+};
 
 // Relay clients (secondaries connected to this primary)
 let relayClients: Set<WebSocket> = new Set();
@@ -894,6 +943,26 @@ function registerClient(info: {
   transport: "ws" | "http";
   ws?: WebSocket;
 }): string {
+  if (info.transport === "http") {
+    for (const existing of clientRegistry.values()) {
+      if (
+        existing.transport === "http" &&
+        existing.userId === info.userId &&
+        existing.username.toLowerCase() === info.username.toLowerCase()
+      ) {
+        existing.placeId = info.placeId;
+        existing.jobId = info.jobId;
+        existing.placeName = info.placeName;
+        existing.lastHttpPoll = Date.now();
+        existing.lastContextUpdate = Date.now();
+        console.error(
+          `[Registry] Refreshed HTTP client: ${existing.clientId} (${info.username} @ ${info.placeName})`
+        );
+        return existing.clientId;
+      }
+    }
+  }
+
   const clientId = crypto.randomUUID();
   const entry: RobloxClient = {
     clientId,
@@ -905,7 +974,8 @@ function registerClient(info: {
     transport: info.transport,
     ws: info.ws,
     lastHttpPoll: Date.now(),
-    pendingHttpCommand: null,
+    lastContextUpdate: Date.now(),
+    pendingHttpCommands: [],
   };
   clientRegistry.set(clientId, entry);
   if (info.ws) {
@@ -923,10 +993,30 @@ function unregisterClient(clientId: string) {
     wsToClientId.delete(entry.ws);
   }
   clientRegistry.delete(clientId);
+  if (defaultClientId === clientId) {
+    defaultClientId = null;
+  }
   console.error(`[Registry] Client unregistered: ${clientId}`);
 }
 
+function pruneStaleClients() {
+  const now = Date.now();
+  for (const [clientId, entry] of clientRegistry.entries()) {
+    if (entry.transport === "ws") {
+      if (!entry.ws || entry.ws.readyState !== WebSocket.OPEN) {
+        unregisterClient(clientId);
+      }
+      continue;
+    }
+
+    if (now - entry.lastHttpPoll >= HTTP_POLL_TIMEOUT) {
+      unregisterClient(clientId);
+    }
+  }
+}
+
 function getActiveClients(): RobloxClient[] {
+  pruneStaleClients();
   const active: RobloxClient[] = [];
   for (const entry of clientRegistry.values()) {
     if (entry.transport === "ws") {
@@ -948,35 +1038,88 @@ function formatActiveClientListForTool(): string {
     return "No Roblox clients are currently connected.";
   }
 
-  const clientList = active.map((c) => ({
-    clientId: c.clientId,
-    username: c.username,
-    placeId: c.placeId,
-    jobId: c.jobId,
-    placeName: c.placeName,
-    transport: c.transport,
-  }));
-
-  return JSON.stringify(clientList, null, 2);
+  return JSON.stringify(
+    {
+      defaultClientId,
+      clients: active.map((c) => ({
+        clientId: c.clientId,
+        username: c.username,
+        userId: c.userId,
+        placeId: c.placeId,
+        jobId: c.jobId,
+        placeName: c.placeName,
+        transport: c.transport,
+        pendingHttpCommands: c.pendingHttpCommands.length,
+        lastHttpPoll: c.lastHttpPoll,
+        lastContextUpdate: c.lastContextUpdate,
+      })),
+    },
+    null,
+    2
+  );
 }
 
 /** Resolve a target client by clientId, or pick the most recently active one. */
-function resolveTargetClient(clientId?: string): RobloxClient | null {
+function resolveTargetClient(
+  clientId?: string,
+  options?: { requireExplicitOnMultiple?: boolean }
+): { client: RobloxClient | null; error?: DispatchFailureCode; message?: string } {
   if (clientId) {
     const entry = clientRegistry.get(clientId);
-    if (!entry) return null;
+    if (!entry) {
+      return {
+        client: null,
+        error: "CLIENT_NOT_FOUND",
+        message: `Client '${clientId}' was not found or is no longer active.`,
+      };
+    }
     // Verify it's still alive
-    if (entry.transport === "ws" && (!entry.ws || entry.ws.readyState !== WebSocket.OPEN)) return null;
-    if (entry.transport === "http" && Date.now() - entry.lastHttpPoll >= HTTP_POLL_TIMEOUT) return null;
-    return entry;
+    if (entry.transport === "ws" && (!entry.ws || entry.ws.readyState !== WebSocket.OPEN)) {
+      return {
+        client: null,
+        error: "CLIENT_NOT_FOUND",
+        message: `Client '${clientId}' is no longer connected.`,
+      };
+    }
+    if (entry.transport === "http" && Date.now() - entry.lastHttpPoll >= HTTP_POLL_TIMEOUT) {
+      return {
+        client: null,
+        error: "CLIENT_NOT_FOUND",
+        message: `Client '${clientId}' is no longer connected.`,
+      };
+    }
+    return { client: entry };
   }
-  // Default: most recently active
+
   const active = getActiveClients();
-  if (active.length === 0) return null;
-  // Prefer WS clients, then most recent HTTP poll
+  if (active.length === 0) {
+    return {
+      client: null,
+      error: "NO_CLIENT",
+      message: "No Roblox clients are currently connected.",
+    };
+  }
+
+  if (defaultClientId) {
+    const preferred = active.find((client) => client.clientId === defaultClientId);
+    if (preferred) {
+      return { client: preferred };
+    }
+  }
+
+  if (options?.requireExplicitOnMultiple && active.length > 1) {
+    return {
+      client: null,
+      error: "MULTI_CLIENT_REQUIRES_TARGET",
+      message: `Multiple Roblox clients are connected (${active.map((c) => `${c.username}:${c.clientId}`).join(", ")}). Specify clientId explicitly.`,
+    };
+  }
+
   const wsCl = active.filter((c) => c.transport === "ws");
-  if (wsCl.length > 0) return wsCl[wsCl.length - 1];
-  return active.sort((a, b) => b.lastHttpPoll - a.lastHttpPoll)[0];
+  if (wsCl.length > 0) {
+    return { client: wsCl[wsCl.length - 1] };
+  }
+  return { client: active.sort((a, b) => b.lastHttpPoll - a.lastHttpPoll)[0] };
 }
 
 // ─── Abstraction layer — these work in both primary & secondary mode ────────────
@@ -988,11 +1131,21 @@ function hasConnectedClients(): boolean {
   return getActiveClients().length > 0;
 }
 
-function SendToClient(target: RobloxClient, message: string) {
+function SendToClient(
+  target: RobloxClient,
+  message: string,
+  requestId: string,
+  toolType: string
+) {
   if (target.transport === "ws" && target.ws && target.ws.readyState === WebSocket.OPEN) {
     target.ws.send(message);
   } else if (target.transport === "http") {
-    target.pendingHttpCommand = message;
+    target.pendingHttpCommands.push({
+      requestId,
+      message,
+      enqueuedAt: Date.now(),
+      toolType,
+    });
   }
 }
 
@@ -1017,6 +1170,17 @@ function GetResponseOfIdFromClient(
       } else {
         httpResponseResolvers.delete(id);
       }
+      requestToClientId.delete(id);
+      timedOutRequests.add(id);
+      requestMetrics.timedOut += 1;
+
+      const executionId = requestToExecutionId.get(id);
+      if (executionId) {
+        updateExecution(executionId, {
+          status: "timed_out",
+          error: `Timed out waiting for response after ${timeoutMs}ms.`,
+        });
+      }
 
       resolveOnce({
         id,
@@ -1038,26 +1202,244 @@ function SendArbitraryDataToClient(
   data: any,
   id: string | undefined = undefined,
   clientId: string | undefined = undefined,
+  options?: { requireExplicitOnMultiple?: boolean }
 ) {
   if (instanceRole === "secondary") {
     // Secondaries relay everything through
     if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN) return null;
     if (id === undefined) id = crypto.randomUUID();
-    const message = { id, ...data, type, ...(clientId ? { targetClientId: clientId } : {}) };
+    const message = {
+      id,
+      ...data,
+      type,
+      ...(clientId ? { targetClientId: clientId } : {}),
+      __requireExplicitOnMultiple: options?.requireExplicitOnMultiple === true,
+    };
     relaySocket.send(JSON.stringify(message));
     return id;
   }
 
-  const target = resolveTargetClient(clientId);
-  if (!target) return null;
+  const targetResolution = resolveTargetClient(clientId, options);
+  if (!targetResolution.client) return null;
+  const target = targetResolution.client;
 
   if (id === undefined) id = crypto.randomUUID();
 
   const message = { id, ...data, type };
   requestToClientId.set(id, target.clientId);
-  SendToClient(target, JSON.stringify(message));
+  requestMetrics.sent += 1;
+  SendToClient(target, JSON.stringify(message), id, type);
 
   return id;
+}
+
+function formatTargetingError(clientId?: string, requireExplicitOnMultiple: boolean = false) {
+  if (instanceRole === "secondary") {
+    if (requireExplicitOnMultiple && !clientId) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "This MCP instance is running as a secondary relay. Specify clientId explicitly for mutating operations.",
+          },
+        ],
+      };
+    }
+    return null;
+  }
+
+  const resolved = resolveTargetClient(clientId, { requireExplicitOnMultiple });
+  if (resolved.client) return null;
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          resolved.message ??
+          "No Roblox client connected to the MCP server. Ask the user to run connector.luau first.",
+      },
+    ],
+  };
+}
+
+function updateExecution(executionId: string, patch: Partial<ExecutionRecord>) {
+  const current = executionRegistry.get(executionId);
+  if (!current) return;
+  executionRegistry.set(executionId, {
+    ...current,
+    ...patch,
+    updatedAt: Date.now(),
+  });
+}
+
+function createExecution(
+  toolType: string,
+  clientId: string,
+  requestId: string,
+  timeoutMs: number,
+  responseMode: "none" | "return",
+  payloadPreview: string,
+  initialStatus: ExecutionRecord["status"]
+) {
+  const executionId = crypto.randomUUID();
+  const record: ExecutionRecord = {
+    executionId,
+    requestId,
+    toolType,
+    clientId,
+    status: initialStatus,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    timeoutMs,
+    responseMode,
+    payloadPreview,
+  };
+  executionRegistry.set(executionId, record);
+  requestToExecutionId.set(requestId, executionId);
+  return record;
+}
+
+function serializeExecution(record: ExecutionRecord) {
+  return {
+    executionId: record.executionId,
+    requestId: record.requestId,
+    toolType: record.toolType,
+    clientId: record.clientId,
+    status: record.status,
+    createdAt: new Date(record.createdAt).toISOString(),
+    updatedAt: new Date(record.updatedAt).toISOString(),
+    timeoutMs: record.timeoutMs,
+    responseMode: record.responseMode,
+    payloadPreview: record.payloadPreview,
+    output: record.output,
+    error: record.error,
+  };
+}
+
+function waitForExecutionState(
+  executionId: string,
+  timeoutMs: number = TOOL_RESPONSE_TIMEOUT
+): Promise<ExecutionRecord | null> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      const record = executionRegistry.get(executionId) || null;
+      if (
+        record &&
+        ["completed", "failed", "timed_out", "cancelled"].includes(record.status)
+      ) {
+        clearInterval(timer);
+        resolve(record);
+        return;
+      }
+
+      if (Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        resolve(record);
+      }
+    }, 100);
+  });
+}
+
+function dispatchTrackedCommand(
+  toolType: string,
+  data: Record<string, unknown>,
+  options?: {
+    clientId?: string;
+    timeoutMs?: number;
+    responseMode?: "none" | "return";
+    requireExplicitOnMultiple?: boolean;
+    payloadPreview?: string;
+  }
+): { execution?: ExecutionRecord; error?: ReturnType<typeof formatTargetingError> } {
+  if (instanceRole === "secondary") {
+    if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN) {
+      return {
+        error: {
+          content: [
+            {
+              type: "text" as const,
+              text: "Relay socket is not connected to the primary MCP instance.",
+            },
+          ],
+        },
+      };
+    }
+    if (options?.requireExplicitOnMultiple && !options?.clientId) {
+      return {
+        error: {
+          content: [
+            {
+              type: "text" as const,
+              text: "Specify clientId explicitly when using tracked execution from a secondary MCP instance.",
+            },
+          ],
+        },
+      };
+    }
+
+    const requestId = crypto.randomUUID();
+    const payload = {
+      id: requestId,
+      ...data,
+      type: toolType,
+      ...(options?.clientId ? { targetClientId: options.clientId } : {}),
+      __requireExplicitOnMultiple: options?.requireExplicitOnMultiple === true,
+    };
+    relaySocket.send(JSON.stringify(payload));
+    const execution = createExecution(
+      toolType,
+      options?.clientId || "relay-target",
+      requestId,
+      options?.timeoutMs ?? TOOL_RESPONSE_TIMEOUT,
+      options?.responseMode ?? "return",
+      options?.payloadPreview ?? toolType,
+      "running"
+    );
+    requestMetrics.sent += 1;
+    void GetResponseOfIdFromClient(requestId, options?.timeoutMs ?? TOOL_RESPONSE_TIMEOUT);
+    return { execution };
+  }
+
+  const targeting = resolveTargetClient(options?.clientId, {
+    requireExplicitOnMultiple: options?.requireExplicitOnMultiple,
+  });
+  if (!targeting.client) {
+    return {
+      error: {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              targeting.message ??
+              "No Roblox client connected to the MCP server. Please ask the user to run connector.luau first.",
+          },
+        ],
+      },
+    };
+  }
+
+  const target = targeting.client;
+  const requestId = crypto.randomUUID();
+  const payload = { id: requestId, ...data, type: toolType };
+  requestToClientId.set(requestId, target.clientId);
+  requestMetrics.sent += 1;
+  SendToClient(target, JSON.stringify(payload), requestId, toolType);
+
+  const execution = createExecution(
+    toolType,
+    target.clientId,
+    requestId,
+    options?.timeoutMs ?? TOOL_RESPONSE_TIMEOUT,
+    options?.responseMode ?? "return",
+    options?.payloadPreview ?? toolType,
+    target.transport === "http" ? "queued" : "running"
+  );
+
+  void GetResponseOfIdFromClient(requestId, options?.timeoutMs ?? TOOL_RESPONSE_TIMEOUT);
+
+  return { execution };
 }
 
 // ─── Primary mode ───────────────────────────────────────────────────────────────
@@ -1071,6 +1453,10 @@ function startAsPrimary(): Promise<void> {
     wsToClientId = new Map();
     httpResponseResolvers = new Map();
     requestToClientId = new Map();
+    requestToExecutionId = new Map();
+    executionRegistry = new Map();
+    defaultClientId = null;
+    requestMetrics = { sent: 0, completed: 0, failed: 0, timedOut: 0, cancelled: 0 };
     relayClients = new Set();
     relayRequestOrigin = new Map();
 
@@ -1094,7 +1480,9 @@ function startAsPrimary(): Promise<void> {
               connected: active.length > 0,
               clientCount: active.length,
               role: "Primary",
+              defaultClientId,
               relayClients: relayClients.size,
+              requestMetrics,
               clients: active.map((c) => ({
                 clientId: c.clientId,
                 username: c.username,
@@ -1103,6 +1491,9 @@ function startAsPrimary(): Promise<void> {
                 jobId: c.jobId,
                 placeName: c.placeName,
                 transport: c.transport,
+                pendingHttpCommands: c.pendingHttpCommands.length,
+                lastHttpPoll: c.lastHttpPoll,
+                lastContextUpdate: c.lastContextUpdate,
               })),
             })
           );
@@ -1153,8 +1544,40 @@ function startAsPrimary(): Promise<void> {
                 placeName: info.placeName || "Unknown",
                 transport: "http",
               });
+              if (defaultClientId === null) {
+                defaultClientId = clientId;
+              }
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ clientId }));
+            } catch {
+              res.writeHead(400);
+              res.end("Invalid JSON");
+            }
+          });
+          return;
+        }
+
+        if (url.pathname === "/context" && req.method === "POST") {
+          let body = "";
+          req.on("data", (chunk) => { body += chunk.toString(); });
+          req.on("end", () => {
+            try {
+              const info = JSON.parse(body);
+              const clientId = info.clientId;
+              const client = clientRegistry.get(clientId);
+              if (!client) {
+                res.writeHead(404);
+                res.end("Unknown clientId");
+                return;
+              }
+
+              if (typeof info.placeId === "number") client.placeId = info.placeId;
+              if (typeof info.jobId === "string") client.jobId = info.jobId;
+              if (typeof info.placeName === "string") client.placeName = info.placeName;
+              client.lastContextUpdate = Date.now();
+
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true }));
             } catch {
               res.writeHead(400);
               res.end("Invalid JSON");
@@ -1181,11 +1604,14 @@ function startAsPrimary(): Promise<void> {
 
           client.lastHttpPoll = Date.now();
 
-          if (client.pendingHttpCommand) {
-            const cmd = client.pendingHttpCommand;
-            client.pendingHttpCommand = null;
+          if (client.pendingHttpCommands.length > 0) {
+            const next = client.pendingHttpCommands.shift()!;
+            const executionId = requestToExecutionId.get(next.requestId);
+            if (executionId) {
+              updateExecution(executionId, { status: "running" });
+            }
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(cmd);
+            res.end(next.message);
           } else {
             res.writeHead(204);
             res.end();
@@ -1201,8 +1627,8 @@ function startAsPrimary(): Promise<void> {
             try {
               const data = JSON.parse(body);
               handleRobloxResponse(data);
-              res.writeHead(200);
-              res.end("OK");
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, id: data.id }));
             } catch {
               res.writeHead(400);
               res.end("Invalid JSON");
@@ -1240,7 +1666,7 @@ function startAsPrimary(): Promise<void> {
           console.error(`[Primary] Relay client connected. Total: ${relayClients.size + 1}`);
           relayClients.add(ws);
 
-          ws.on("message", (rawData) => {
+          ws.on("message", async (rawData) => {
             try {
               const message = JSON.parse(rawData.toString());
 
@@ -1250,6 +1676,106 @@ function startAsPrimary(): Promise<void> {
                   JSON.stringify({
                     id: message.id,
                     output: formatActiveClientListForTool(),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-health") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(getHealthPayload(), null, 2),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-bridge-topology") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(getBridgeTopologyPayload(), null, 2),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-request-metrics") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(getRequestMetricsSnapshot(), null, 2),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-default-client") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(getDefaultClientPayload(), null, 2),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-targeting-policy") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(
+                      {
+                        defaultClientId,
+                        requireClientIdForMutationsWhenMultipleClients: true,
+                        activeClients: getActiveClients().map(getClientContextSnapshot),
+                      },
+                      null,
+                      2
+                    ),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "list-pending-commands") {
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: JSON.stringify(
+                      getPendingCommandsPayload(
+                        typeof message.clientId === "string" ? message.clientId : undefined
+                      ),
+                      null,
+                      2
+                    ),
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "wait-for-client") {
+                const match = await waitForClientMatch(
+                  typeof message.clientId === "string" ? message.clientId : undefined,
+                  typeof message.username === "string" ? message.username : undefined,
+                  typeof message.timeoutMs === "number" ? message.timeoutMs : 30000
+                );
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: match
+                      ? JSON.stringify(getClientContextSnapshot(match), null, 2)
+                      : `Timed out waiting for client after ${typeof message.timeoutMs === "number" ? message.timeoutMs : 30000}ms.`,
+                  })
+                );
+                return;
+              }
+              if (message.id && message.type === "get-client-context") {
+                const resolved = resolveTargetClient(
+                  typeof message.clientId === "string" ? message.clientId : undefined,
+                  { requireExplicitOnMultiple: true }
+                );
+                ws.send(
+                  JSON.stringify({
+                    id: message.id,
+                    output: resolved.client
+                      ? JSON.stringify(getClientContextSnapshot(resolved.client), null, 2)
+                      : undefined,
+                    error: resolved.client ? undefined : resolved.message,
                   })
                 );
                 return;
@@ -1264,18 +1790,28 @@ function startAsPrimary(): Promise<void> {
               if (targetClientId) {
                 delete message.targetClientId;
               }
+              const requireExplicitOnMultiple = message.__requireExplicitOnMultiple === true;
+              delete message.__requireExplicitOnMultiple;
 
-              const target = resolveTargetClient(targetClientId);
-              if (target) {
-                requestToClientId.set(message.id, target.clientId);
-                SendToClient(target, JSON.stringify(message));
+              const targetResolution = resolveTargetClient(targetClientId, {
+                requireExplicitOnMultiple,
+              });
+              if (targetResolution.client) {
+                requestToClientId.set(message.id, targetResolution.client.clientId);
+                requestMetrics.sent += 1;
+                SendToClient(
+                  targetResolution.client,
+                  JSON.stringify(message),
+                  message.id,
+                  message.type || "relay"
+                );
               } else if (message.id) {
                 relayRequestOrigin.delete(message.id);
                 ws.send(
                   JSON.stringify({
                     id: message.id,
                     output: undefined,
-                    error: "No active Roblox client connected.",
+                    error: targetResolution.message || "No active Roblox client connected.",
                   })
                 );
               }
@@ -1320,6 +1856,9 @@ function startAsPrimary(): Promise<void> {
                 transport: "ws",
                 ws,
               });
+              if (defaultClientId === null) {
+                defaultClientId = clientId;
+              }
               // Send the clientId back
               ws.send(JSON.stringify({ type: "registered", clientId }));
               return;
@@ -1352,6 +1891,25 @@ function startAsPrimary(): Promise<void> {
  */
 function handleRobloxResponse(data: any) {
   if (!data.id) return;
+
+  const wasTimedOut = timedOutRequests.has(data.id);
+  if (wasTimedOut) {
+    timedOutRequests.delete(data.id);
+  }
+
+  const executionId = requestToExecutionId.get(data.id);
+  if (executionId) {
+    updateExecution(executionId, {
+      status: data.error ? "failed" : "completed",
+      output: data.output,
+      error: data.error,
+    });
+    requestToExecutionId.delete(data.id);
+  }
+  if (!wasTimedOut) {
+    if (data.error) requestMetrics.failed += 1;
+    else requestMetrics.completed += 1;
+  }
 
   // Check if this response belongs to a relayed secondary request
   const originRelay = relayRequestOrigin.get(data.id);
@@ -1390,9 +1948,29 @@ function startAsSecondary(): void {
   relaySocket.on("message", (rawData) => {
     try {
       const data = JSON.parse(rawData.toString());
+      const wasTimedOut = data.id ? timedOutRequests.has(data.id) : false;
+      if (data.id && wasTimedOut) {
+        timedOutRequests.delete(data.id);
+      }
+      if (data.id) {
+        const executionId = requestToExecutionId.get(data.id);
+        if (executionId) {
+          updateExecution(executionId, {
+            status: data.error ? "failed" : "completed",
+            output: data.output,
+            error: data.error,
+          });
+          requestToExecutionId.delete(data.id);
+        }
+        if (!wasTimedOut) {
+          if (data.error) requestMetrics.failed += 1;
+          else requestMetrics.completed += 1;
+        }
+      }
       if (data.id && secondaryResponseResolvers.has(data.id)) {
         secondaryResponseResolvers.get(data.id)!(data);
         secondaryResponseResolvers.delete(data.id);
+        requestToClientId.delete(data.id);
       }
     } catch (e) {
       console.error("[Secondary] Error parsing relay response:", e);
@@ -1607,9 +2185,24 @@ async function callClientTool(
   toolType: string,
   payload: Record<string, unknown>,
   clientId: string | undefined,
-  failurePrefix: string
+  failurePrefix: string,
+  options?: { requireExplicitOnMultiple?: boolean }
 ) {
-  const toolCallId = SendArbitraryDataToClient(toolType, payload, undefined, clientId);
+  const targetingError = formatTargetingError(
+    clientId,
+    options?.requireExplicitOnMultiple ?? false
+  );
+  if (targetingError) {
+    return targetingError;
+  }
+
+  const toolCallId = SendArbitraryDataToClient(
+    toolType,
+    payload,
+    undefined,
+    clientId,
+    options
+  );
   if (toolCallId === null) {
     return NO_CLIENT_ERROR;
   }
@@ -1640,6 +2233,7 @@ function registerDexActionWrapper(
   description: string,
   inputSchema: z.ZodTypeAny,
   buildActionRequest: (input: Record<string, unknown>) => Record<string, unknown>,
+  options: { requireExplicitOnMultiple?: boolean } = { requireExplicitOnMultiple: true },
 ) {
   server.registerTool(
     name,
@@ -1658,9 +2252,144 @@ function registerDexActionWrapper(
         actionRequest,
         clientId,
         `Failed to run ${name}`,
+        options,
       );
     },
   );
+}
+
+function getTransportSummary() {
+  const active = getActiveClients();
+  return {
+    totalClients: active.length,
+    wsClients: active.filter((client) => client.transport === "ws").length,
+    httpClients: active.filter((client) => client.transport === "http").length,
+    relayConnected: relaySocket !== null && relaySocket.readyState === WebSocket.OPEN,
+    relayClients: relayClients.size,
+    role: instanceRole,
+    defaultClientId,
+  };
+}
+
+function getRequestMetricsSnapshot() {
+  const pendingHttpCommands = getActiveClients().reduce(
+    (sum, client) => sum + client.pendingHttpCommands.length,
+    0
+  );
+  return {
+    ...requestMetrics,
+    pendingResolvers:
+      instanceRole === "secondary"
+        ? secondaryResponseResolvers.size
+        : httpResponseResolvers.size,
+    activeExecutions: executionRegistry.size,
+    queuedHttpCommands: pendingHttpCommands,
+  };
+}
+
+function getClientContextSnapshot(client: RobloxClient) {
+  return {
+    clientId: client.clientId,
+    username: client.username,
+    userId: client.userId,
+    placeId: client.placeId,
+    jobId: client.jobId,
+    placeName: client.placeName,
+    transport: client.transport,
+    pendingHttpCommands: client.pendingHttpCommands.length,
+    lastHttpPoll: client.lastHttpPoll,
+    lastContextUpdate: client.lastContextUpdate,
+    isDefault: defaultClientId === client.clientId,
+  };
+}
+
+async function getRemoteRelayListClients() {
+  const id = crypto.randomUUID();
+  if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN) {
+    return null;
+  }
+  relaySocket.send(JSON.stringify({ id, type: "list-clients" }));
+  return GetResponseOfIdFromClient(id);
+}
+
+async function relayRequestToPrimary(
+  type: string,
+  payload: Record<string, unknown> = {}
+) {
+  if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN) {
+    return null;
+  }
+  const id = crypto.randomUUID();
+  relaySocket.send(JSON.stringify({ id, type, ...payload }));
+  return GetResponseOfIdFromClient(id);
+}
+
+function getHealthPayload() {
+  return {
+    status: "ok",
+    topology: getTransportSummary(),
+    metrics: getRequestMetricsSnapshot(),
+    activeClients: getActiveClients().map(getClientContextSnapshot),
+  };
+}
+
+function getBridgeTopologyPayload() {
+  return {
+    topology: getTransportSummary(),
+    activeClients: getActiveClients().map(getClientContextSnapshot),
+  };
+}
+
+function getDefaultClientPayload() {
+  const active = getActiveClients();
+  const client = defaultClientId
+    ? active.find((entry) => entry.clientId === defaultClientId) ?? null
+    : null;
+  return {
+    defaultClientId,
+    client: client ? getClientContextSnapshot(client) : null,
+  };
+}
+
+function getPendingCommandsPayload(clientId?: string) {
+  const active = getActiveClients().filter((client) =>
+    clientId ? client.clientId === clientId : true
+  );
+  const queued = active.map((client) => ({
+    clientId: client.clientId,
+    username: client.username,
+    transport: client.transport,
+    pendingHttpCommands: client.pendingHttpCommands.map((item) => ({
+      requestId: item.requestId,
+      toolType: item.toolType,
+      enqueuedAt: new Date(item.enqueuedAt).toISOString(),
+    })),
+  }));
+  return {
+    queued,
+    executions: Array.from(executionRegistry.values()).map(serializeExecution),
+  };
+}
+
+async function waitForClientMatch(
+  clientId: string | undefined,
+  username: string | undefined,
+  timeoutMs: number
+) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const active = getActiveClients();
+    const match = active.find((client) => {
+      if (clientId && client.clientId !== clientId) return false;
+      if (username && client.username.toLowerCase() !== username.toLowerCase()) return false;
+      return true;
+    });
+    if (match) {
+      return match;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return null;
 }
 
 // ─── Tool registrations (work in both primary & secondary mode) ─────────────────
@@ -1674,11 +2403,8 @@ server.registerTool(
   },
   async () => {
     if (instanceRole === "secondary") {
-      // Secondaries ask the primary for client list
-      const id = crypto.randomUUID();
-      if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
-        relaySocket.send(JSON.stringify({ id, type: "list-clients" }));
-        const response = await GetResponseOfIdFromClient(id);
+      const response = await getRemoteRelayListClients();
+      if (response) {
         return {
           content: [
             {
@@ -1696,6 +2422,651 @@ server.registerTool(
         {
           type: "text",
           text: formatActiveClientListForTool(),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-health",
+  {
+    title: "Get server health",
+    description:
+      "Returns MCP bridge health, role, client counts, default client, and request/execution counters.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-health");
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get health." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    const payload = {
+      status: "ok",
+      topology: getTransportSummary(),
+      metrics: getRequestMetricsSnapshot(),
+      activeClients: getActiveClients().map(getClientContextSnapshot),
+    };
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+    };
+  }
+);
+
+server.registerTool(
+  "get-bridge-topology",
+  {
+    title: "Get bridge topology",
+    description:
+      "Shows whether this instance is primary or secondary, relay status, and active clients grouped by transport.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-bridge-topology");
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get bridge topology." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              topology: getTransportSummary(),
+              activeClients: getActiveClients().map(getClientContextSnapshot),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-request-metrics",
+  {
+    title: "Get request metrics",
+    description:
+      "Returns request, timeout, failure, cancellation, and pending queue metrics for the bridge.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-request-metrics");
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get request metrics." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(getRequestMetricsSnapshot(), null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-default-client",
+  {
+    title: "Get default client",
+    description:
+      "Returns the current default client used when a tool omits clientId.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-default-client");
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get default client." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    const active = getActiveClients();
+    const client = defaultClientId
+      ? active.find((entry) => entry.clientId === defaultClientId) ?? null
+      : null;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              defaultClientId,
+              client: client ? getClientContextSnapshot(client) : null,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-targeting-policy",
+  {
+    title: "Get targeting policy",
+    description:
+      "Explain how client targeting works, including whether explicit clientId is required for mutating tools.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-targeting-policy");
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get targeting policy." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              defaultClientId,
+              requireClientIdForMutationsWhenMultipleClients: true,
+              activeClients: getActiveClients().map(getClientContextSnapshot),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "set-default-client",
+  {
+    title: "Set default client",
+    description:
+      "Set the default client used when tools omit clientId.",
+    inputSchema: z.object({
+      clientId: z.string().describe("Target clientId from list-clients."),
+    }),
+  },
+  async ({ clientId }) => {
+    if (instanceRole === "secondary") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Setting the default client is only supported on the primary MCP instance.",
+          },
+        ],
+      };
+    }
+    const resolved = resolveTargetClient(clientId);
+    if (!resolved.client) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: resolved.message ?? `Client not found: ${clientId}`,
+          },
+        ],
+      };
+    }
+
+    defaultClientId = resolved.client.clientId;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              defaultClientId,
+              client: getClientContextSnapshot(resolved.client),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "clear-default-client",
+  {
+    title: "Clear default client",
+    description: "Clear the default client override.",
+  },
+  async () => {
+    if (instanceRole === "secondary") {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Clearing the default client is only supported on the primary MCP instance.",
+          },
+        ],
+      };
+    }
+    defaultClientId = null;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ defaultClientId: null }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "wait-for-client",
+  {
+    title: "Wait for client",
+    description:
+      "Wait until a client appears. Optionally filter by clientId or username.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+      username: z.string().optional(),
+      timeoutMs: z.number().optional().default(30000),
+    }),
+  },
+  async ({ clientId, username, timeoutMs }) => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("wait-for-client", {
+        clientId,
+        username,
+        timeoutMs,
+      });
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to wait for client." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const active = getActiveClients();
+      const match = active.find((client) => {
+        if (clientId && client.clientId !== clientId) return false;
+        if (username && client.username.toLowerCase() !== username.toLowerCase()) return false;
+        return true;
+      });
+      if (match) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(getClientContextSnapshot(match), null, 2),
+            },
+          ],
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Timed out waiting for client after ${timeoutMs}ms.`,
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-client-context",
+  {
+    title: "Get client context",
+    description:
+      "Return detailed context for a connected client, including place, job, transport, and pending HTTP queue length.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("get-client-context", {
+        clientId,
+      });
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to get client context." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) {
+      return targetingError;
+    }
+    const client = resolveTargetClient(clientId).client!;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(getClientContextSnapshot(client), null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-connector-health",
+  {
+    title: "Get connector health",
+    description:
+      "Return connector-side health, transport mode, context, Dex state, and script indexing progress.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    return callClientTool(
+      "get-connector-health",
+      {},
+      clientId,
+      "Failed to get connector health"
+    );
+  }
+);
+
+server.registerTool(
+  "list-pending-commands",
+  {
+    title: "List pending commands",
+    description:
+      "List queued HTTP commands and tracked executions that have not finished yet.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    if (instanceRole === "secondary") {
+      const response = await relayRequestToPrimary("list-pending-commands", {
+        clientId,
+      });
+      if (response) {
+        return {
+          content: [{ type: "text" as const, text: response.output ?? response.error ?? "Failed to list pending commands." }],
+        };
+      }
+      return NO_CLIENT_ERROR;
+    }
+    const active = getActiveClients().filter((client) =>
+      clientId ? client.clientId === clientId : true
+    );
+    const queued = active.map((client) => ({
+      clientId: client.clientId,
+      username: client.username,
+      transport: client.transport,
+      pendingHttpCommands: client.pendingHttpCommands.map((item) => ({
+        requestId: item.requestId,
+        toolType: item.toolType,
+        enqueuedAt: new Date(item.enqueuedAt).toISOString(),
+      })),
+    }));
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              queued,
+              executions: Array.from(executionRegistry.values()).map(serializeExecution),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-script-index-status",
+  {
+    title: "Get script index status",
+    description:
+      "Return connector-side script source indexing status, including mapped count and remaining work.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    return callClientTool(
+      "get-script-index-status",
+      {},
+      clientId,
+      "Failed to get script index status"
+    );
+  }
+);
+
+server.registerTool(
+  "get-dex-bridge-health",
+  {
+    title: "Get Dex bridge health",
+    description:
+      "Return Dex bridge readiness, load status, location, and bridge patch state.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    return callClientTool(
+      "get-dex-bridge-health",
+      {},
+      clientId,
+      "Failed to get Dex bridge health"
+    );
+  }
+);
+
+server.registerTool(
+  "get-dex-snapshot",
+  {
+    title: "Get Dex snapshot",
+    description:
+      "Aggregate Dex health, status, and overview into a single response.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    const healthResult = await callClientTool(
+      "get-dex-bridge-health",
+      {},
+      clientId,
+      "Failed to get Dex bridge health"
+    );
+    const overviewResult = await callClientTool(
+      "get-dex-overview",
+      {},
+      clientId,
+      "Failed to get Dex overview"
+    );
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              health: healthResult.content?.[0]?.text ?? null,
+              overview: overviewResult.content?.[0]?.text ?? null,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "wait-for-dex-ready",
+  {
+    title: "Wait for Dex ready",
+    description:
+      "Poll Dex bridge health until the bridge reports ready or the timeout expires.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+      timeoutMs: z.number().optional().default(MUTATION_TIMEOUT_MS),
+    }),
+  },
+  async ({ clientId, timeoutMs }) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const result = await callClientTool(
+        "get-dex-bridge-health",
+        {},
+        clientId,
+        "Failed to get Dex bridge health"
+      );
+      const textContent = result.content?.[0]?.text;
+      try {
+        const parsed = JSON.parse(textContent ?? "{}");
+        if (parsed.bridgeReady === true || parsed.bridgeStatus === "ready") {
+          return result;
+        }
+      } catch {
+        return result;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Timed out waiting for Dex ready after ${timeoutMs}ms.`,
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-remote-spy-status",
+  {
+    title: "Get remote spy status",
+    description:
+      "Return remote-spy loaded status plus blocked and ignored remote policies.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    return callClientTool(
+      "get-remote-spy-status",
+      {},
+      clientId,
+      "Failed to get remote spy status"
+    );
+  }
+);
+
+server.registerTool(
+  "get-remote-spy-summary",
+  {
+    title: "Get remote spy summary",
+    description:
+      "Return remote spy status plus a compact activity summary from current logs.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+      limit: z.number().optional().default(20),
+    }),
+  },
+  async ({ clientId, limit }) => {
+    const statusResult = await callClientTool(
+      "get-remote-spy-status",
+      {},
+      clientId,
+      "Failed to get remote spy status"
+    );
+    const logsResult = await callClientTool(
+      "get-remote-spy-logs",
+      {
+        direction: "Both",
+        remoteNameFilter: "",
+        limit,
+        maxCallsPerRemote: 3,
+      },
+      clientId,
+      "Failed to get remote spy logs"
+    );
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              status: statusResult.content?.[0]?.text ?? null,
+              logs: logsResult.content?.[0]?.text ?? null,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "doctor",
+  {
+    title: "Run bridge diagnostics",
+    description:
+      "Aggregate bridge health, request metrics, topology, and optional client-side connector health into one report.",
+    inputSchema: z.object({
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ clientId }) => {
+    const local = {
+      topology: getTransportSummary(),
+      metrics: getRequestMetricsSnapshot(),
+      defaultClientId,
+    };
+    let connector: any = null;
+    if (clientId || getActiveClients().length > 0) {
+      const remote = await callClientTool(
+        "get-connector-health",
+        {},
+        clientId,
+        "Failed to get connector health"
+      );
+      connector = remote.content?.[0]?.text ?? null;
+    }
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ local, connector }, null, 2),
         },
       ],
     };
@@ -1723,11 +3094,14 @@ server.registerTool(
     }),
   },
   async ({ code, threadContext, clientId }) => {
-    console.error(`Executing code in thread ${threadContext}...`);
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) {
+      return targetingError;
+    }
 
     const result = SendArbitraryDataToClient("execute", {
       source: `setthreadidentity(${threadContext})\n${code}`,
-    }, undefined, clientId);
+    }, undefined, clientId, { requireExplicitOnMultiple: true });
 
     if (result === null) {
       return NO_CLIENT_ERROR;
@@ -1737,7 +3111,7 @@ server.registerTool(
       content: [
         {
           type: "text",
-          text: `Code has been scheduled to be run in thread context ${threadContext}.`,
+          text: `Code has been scheduled on client ${clientId ?? defaultClientId ?? "default"} in thread context ${threadContext}.`,
         },
       ],
     };
@@ -1767,6 +3141,11 @@ server.registerTool(
     }),
   },
   async ({ filePath, threadContext, clientId }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) {
+      return targetingError;
+    }
+
     if (!fs.existsSync(filePath)) {
       return {
         content: [
@@ -1779,11 +3158,9 @@ server.registerTool(
     }
 
     const code = fs.readFileSync(filePath, "utf-8");
-    console.error(`Executing file ${filePath} in thread ${threadContext}...`);
-
     const result = SendArbitraryDataToClient("execute", {
       source: `setthreadidentity(${threadContext})\n${code}`,
-    }, undefined, clientId);
+    }, undefined, clientId, { requireExplicitOnMultiple: true });
 
     if (result === null) {
       return NO_CLIENT_ERROR;
@@ -1796,6 +3173,226 @@ server.registerTool(
           text: `File executed: ${filePath} (thread context ${threadContext})`,
         },
       ],
+    };
+  }
+);
+
+server.registerTool(
+  "run-code",
+  {
+    title: "Run code in the Roblox Game Client",
+    description:
+      "Unified execution tool. Supports inline code or file input and optional returned values.",
+    inputSchema: z.object({
+      code: z.string().optional(),
+      filePath: z.string().optional(),
+      responseMode: z.enum(["none", "return"]).optional().default("return"),
+      threadContext: z.number().optional().default(8),
+      clientId: clientIdSchema,
+      timeoutMs: z.number().optional().default(MUTATION_TIMEOUT_MS),
+    }),
+  },
+  async ({ code, filePath, responseMode, threadContext, clientId, timeoutMs }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) {
+      return targetingError;
+    }
+
+    if (!code && !filePath) {
+      return {
+        content: [{ type: "text" as const, text: "Provide either code or filePath." }],
+      };
+    }
+    if (code && filePath) {
+      return {
+        content: [{ type: "text" as const, text: "Provide code or filePath, not both." }],
+      };
+    }
+
+    const finalCode = filePath ? fs.readFileSync(filePath, "utf-8") : code!;
+    const toolType = responseMode === "return" ? "get-data-by-code" : "execute";
+    const dispatch = dispatchTrackedCommand(
+      toolType,
+      { source: `setthreadidentity(${threadContext})\n${finalCode}` },
+      {
+        clientId,
+        timeoutMs,
+        responseMode,
+        requireExplicitOnMultiple: true,
+        payloadPreview: filePath ? `file:${filePath}` : finalCode.slice(0, 200),
+      }
+    );
+    if (dispatch.error) return dispatch.error;
+
+    const record = dispatch.execution!;
+    const settled = await waitForExecutionState(record.executionId, timeoutMs);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              execution: serializeExecution(settled ?? record),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "start-execution",
+  {
+    title: "Start tracked execution",
+    description:
+      "Start a tracked execution and return an executionId for later inspection.",
+    inputSchema: z.object({
+      code: z.string().optional(),
+      filePath: z.string().optional(),
+      responseMode: z.enum(["none", "return"]).optional().default("return"),
+      threadContext: z.number().optional().default(8),
+      clientId: clientIdSchema,
+      timeoutMs: z.number().optional().default(MUTATION_TIMEOUT_MS),
+    }),
+  },
+  async ({ code, filePath, responseMode, threadContext, clientId, timeoutMs }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) {
+      return targetingError;
+    }
+    if (!code && !filePath) {
+      return { content: [{ type: "text" as const, text: "Provide either code or filePath." }] };
+    }
+    if (code && filePath) {
+      return { content: [{ type: "text" as const, text: "Provide code or filePath, not both." }] };
+    }
+
+    const finalCode = filePath ? fs.readFileSync(filePath, "utf-8") : code!;
+    const toolType = responseMode === "return" ? "get-data-by-code" : "execute";
+    const dispatch = dispatchTrackedCommand(
+      toolType,
+      { source: `setthreadidentity(${threadContext})\n${finalCode}` },
+      {
+        clientId,
+        timeoutMs,
+        responseMode,
+        requireExplicitOnMultiple: true,
+        payloadPreview: filePath ? `file:${filePath}` : finalCode.slice(0, 200),
+      }
+    );
+    if (dispatch.error) return dispatch.error;
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ execution: serializeExecution(dispatch.execution!) }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "get-execution",
+  {
+    title: "Get execution status",
+    description: "Inspect a tracked execution by executionId.",
+    inputSchema: z.object({
+      executionId: z.string(),
+    }),
+  },
+  async ({ executionId }) => {
+    const record = executionRegistry.get(executionId);
+    if (!record) {
+      return {
+        content: [{ type: "text" as const, text: `Execution not found: ${executionId}` }],
+      };
+    }
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(serializeExecution(record), null, 2) }],
+    };
+  }
+);
+
+server.registerTool(
+  "wait-for-execution",
+  {
+    title: "Wait for execution",
+    description: "Wait for a tracked execution to complete or fail.",
+    inputSchema: z.object({
+      executionId: z.string(),
+      timeoutMs: z.number().optional().default(MUTATION_TIMEOUT_MS),
+    }),
+  },
+  async ({ executionId, timeoutMs }) => {
+    const record = executionRegistry.get(executionId);
+    if (!record) {
+      return {
+        content: [{ type: "text" as const, text: `Execution not found: ${executionId}` }],
+      };
+    }
+    const settled = await waitForExecutionState(executionId, timeoutMs);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(serializeExecution(settled ?? record), null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "cancel-execution",
+  {
+    title: "Cancel execution",
+    description:
+      "Cancel a queued execution if it has not yet been dispatched to a client.",
+    inputSchema: z.object({
+      executionId: z.string(),
+    }),
+  },
+  async ({ executionId }) => {
+    const record = executionRegistry.get(executionId);
+    if (!record) {
+      return {
+        content: [{ type: "text" as const, text: `Execution not found: ${executionId}` }],
+      };
+    }
+    if (record.status !== "queued") {
+      return {
+        content: [{ type: "text" as const, text: `Execution ${executionId} is already ${record.status}.` }],
+      };
+    }
+
+    const client = clientRegistry.get(record.clientId);
+    if (!client || client.transport !== "http") {
+      return {
+        content: [{ type: "text" as const, text: `Execution ${executionId} can no longer be cancelled.` }],
+      };
+    }
+
+    const before = client.pendingHttpCommands.length;
+    client.pendingHttpCommands = client.pendingHttpCommands.filter(
+      (item) => item.requestId !== record.requestId
+    );
+    if (client.pendingHttpCommands.length === before) {
+      return {
+        content: [{ type: "text" as const, text: `Execution ${executionId} is no longer queued.` }],
+      };
+    }
+
+    updateExecution(executionId, { status: "cancelled", error: "Cancelled before dispatch." });
+    requestToExecutionId.delete(record.requestId);
+    requestToClientId.delete(record.requestId);
+    requestMetrics.cancelled += 1;
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(serializeExecution(executionRegistry.get(executionId)!), null, 2) }],
     };
   }
 );
@@ -1902,7 +3499,10 @@ server.registerTool(
     }),
   },
   async ({ code, threadContext, clientId }) => {
-    console.error(`Executing code in thread ${threadContext}...`);
+    const targetingError = formatTargetingError(clientId, false);
+    if (targetingError) {
+      return targetingError;
+    }
 
     const toolCallId = SendArbitraryDataToClient("get-data-by-code", {
       source: `setthreadidentity(${threadContext});${code}`,
@@ -2290,44 +3890,13 @@ server.registerTool(
     }),
   },
   async ({ clientId }) => {
-    const toolCallId = SendArbitraryDataToClient(
+    return callClientTool(
       "ensure-remote-spy",
       {},
-      undefined,
-      clientId
+      clientId,
+      "Failed to ensure remote spy",
+      { requireExplicitOnMultiple: true }
     );
-
-    if (toolCallId === null) {
-      return NO_CLIENT_ERROR;
-    }
-
-    const response = (await GetResponseOfIdFromClient(toolCallId)) as
-      | {
-          output: string;
-        }
-      | undefined;
-
-    if (response === undefined || response.output === undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Failed to ensure remote spy. Response: " +
-              JSON.stringify(response),
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: response.output,
-        },
-      ],
-    };
   }
 );
 
@@ -2424,32 +3993,13 @@ server.registerTool(
     }),
   },
   async ({ clientId }) => {
-    const toolCallId = SendArbitraryDataToClient(
+    return callClientTool(
       "clear-remote-spy-logs",
       {},
-      undefined,
-      clientId
+      clientId,
+      "Failed to clear remote spy logs",
+      { requireExplicitOnMultiple: true }
     );
-
-    if (toolCallId === null) {
-      return NO_CLIENT_ERROR;
-    }
-
-    const response = (await GetResponseOfIdFromClient(toolCallId)) as
-      | { output: string }
-      | undefined;
-
-    if (response === undefined || response.output === undefined) {
-      return {
-        content: [
-          { type: "text", text: "Failed to clear remote spy logs. Response: " + JSON.stringify(response) },
-        ],
-      };
-    }
-
-    return {
-      content: [{ type: "text", text: response.output }],
-    };
   }
 );
 
@@ -2475,11 +4025,15 @@ server.registerTool(
     }),
   },
   async ({ remoteName, direction, shouldBlock, clientId }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) return targetingError;
+
     const toolCallId = SendArbitraryDataToClient(
       "block-remote",
       { remoteName, direction, shouldBlock },
       undefined,
-      clientId
+      clientId,
+      { requireExplicitOnMultiple: true }
     );
 
     if (toolCallId === null) {
@@ -2526,11 +4080,15 @@ server.registerTool(
     }),
   },
   async ({ remoteName, direction, shouldIgnore, clientId }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) return targetingError;
+
     const toolCallId = SendArbitraryDataToClient(
       "ignore-remote",
       { remoteName, direction, shouldIgnore },
       undefined,
-      clientId
+      clientId,
+      { requireExplicitOnMultiple: true }
     );
 
     if (toolCallId === null) {
@@ -2576,37 +4134,65 @@ server.registerTool(
     }),
   },
   async ({ waitTimeoutMs, clientId }) => {
-    const toolCallId = SendArbitraryDataToClient(
+    return callClientTool(
       "ensure-dex",
       { waitTimeoutMs },
-      undefined,
-      clientId
+      clientId,
+      "Failed to ensure Dex explorer",
+      { requireExplicitOnMultiple: true }
     );
+  }
+);
 
-    if (toolCallId === null) {
-      return NO_CLIENT_ERROR;
-    }
+server.registerTool(
+  "remote-spy-block",
+  {
+    title: "Block or unblock a remote (remote-spy alias)",
+    description:
+      "Alias for block-remote with remote-spy-prefixed naming.",
+    inputSchema: z.object({
+      remoteName: z.string(),
+      direction: z.enum(["Incoming", "Outgoing"]),
+      shouldBlock: z.boolean().optional().default(true),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ remoteName, direction, shouldBlock, clientId }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) return targetingError;
+    return callClientTool(
+      "block-remote",
+      { remoteName, direction, shouldBlock },
+      clientId,
+      "Failed to block/unblock remote",
+      { requireExplicitOnMultiple: true }
+    );
+  }
+);
 
-    const response = (await GetResponseOfIdFromClient(toolCallId)) as
-      | { output: string }
-      | undefined;
-
-    if (response === undefined || response.output === undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Failed to ensure Dex explorer. Response: " +
-              JSON.stringify(response),
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [{ type: "text", text: response.output }],
-    };
+server.registerTool(
+  "remote-spy-ignore",
+  {
+    title: "Ignore or unignore a remote (remote-spy alias)",
+    description:
+      "Alias for ignore-remote with remote-spy-prefixed naming.",
+    inputSchema: z.object({
+      remoteName: z.string(),
+      direction: z.enum(["Incoming", "Outgoing"]),
+      shouldIgnore: z.boolean().optional().default(true),
+      clientId: clientIdSchema,
+    }),
+  },
+  async ({ remoteName, direction, shouldIgnore, clientId }) => {
+    const targetingError = formatTargetingError(clientId, true);
+    if (targetingError) return targetingError;
+    return callClientTool(
+      "ignore-remote",
+      { remoteName, direction, shouldIgnore },
+      clientId,
+      "Failed to ignore/unignore remote",
+      { requireExplicitOnMultiple: true }
+    );
   }
 );
 
@@ -3109,37 +4695,13 @@ server.registerTool(
     }),
   },
   async ({ open, clientId }) => {
-    const toolCallId = SendArbitraryDataToClient(
+    return callClientTool(
       "set-dex-menu-open",
       { open },
-      undefined,
-      clientId
+      clientId,
+      "Failed to set Dex menu state",
+      { requireExplicitOnMultiple: true }
     );
-
-    if (toolCallId === null) {
-      return NO_CLIENT_ERROR;
-    }
-
-    const response = (await GetResponseOfIdFromClient(toolCallId)) as
-      | { output: string }
-      | undefined;
-
-    if (response === undefined || response.output === undefined) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Failed to set Dex menu state. Response: " +
-              JSON.stringify(response),
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [{ type: "text", text: response.output }],
-    };
   }
 );
 
@@ -3192,6 +4754,7 @@ server.registerTool(
       },
       clientId,
       "Failed to execute dex-action",
+      { requireExplicitOnMultiple: true },
     );
   },
 );
@@ -3230,6 +4793,7 @@ server.registerTool(
       { actions, stopOnError },
       clientId,
       "Failed to execute dex-batch-actions",
+      { requireExplicitOnMultiple: true },
     );
   },
 );
